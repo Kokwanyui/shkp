@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: stack to deploy all custom resources on prod
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  GlueIamRole:
+    Type: String
+  GlueSecurityGroupID:
+    Type: AWS::EC2::SecurityGroup::Id
+  SecretManagerNameDB02:
+    Type: String
+  SubnetID:
+    Type: AWS::EC2::Subnet::Id
+  SecretManagerNameFoodOrdering:
+    Type: String
+  GlueDB01replica:
+    Type: String
+  GlueConnector01replica:
+    Type: String
+  GlueDBMagicCart:
+    Type: String
+
+
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+  IsNotDev: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'dev'
+
+Outputs:
+  GlueConnector02replica:
+    Value: !Ref GlueConnector02replica
+  GlueConnectorFoodOrdering:
+    Value: !Ref GlueConnectorFoodOrdering
+
+Resources:
+# Custom Resources on Env - Start
+  # Creating Glue DataBase - Start
+  GlueDB02replica:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database to connect db02 all schema
+        Name: !Join
+          - '_'
+          - - !Ref AWSTeam
+            - 02replica
+            - !If
+              - IsNotPrd
+              - !Ref AWSEnv
+              - !Ref 'AWS::NoValue'
+  # Creating Glue DataBase - End
+
+  # Creating Glue Connection - Start
+  GlueConnector02replica:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Description: "Connect to DB02 replica MySQL database."
+        ConnectionType: "JDBC"
+        PhysicalConnectionRequirements:
+          SecurityGroupIdList:
+            - !Ref GlueSecurityGroupID
+          SubnetId: !Ref SubnetID
+        ConnectionProperties:
+          JDBC_CONNECTION_URL: !Join
+            - ''
+            - - 'jdbc:mysql://'
+              - !Sub '{{resolve:secretsmanager:${SecretManagerNameDB02}:SecretString:host}}'
+              - ':'
+              - !Sub '{{resolve:secretsmanager:${SecretManagerNameDB02}:SecretString:port}}'
+              - '/'
+              - !Sub '{{resolve:secretsmanager:${SecretManagerNameDB02}:SecretString:dbname}}'
+          USERNAME: !Sub '{{resolve:secretsmanager:${SecretManagerNameDB02}:SecretString:username}}'
+          PASSWORD: !Sub '{{resolve:secretsmanager:${SecretManagerNameDB02}:SecretString:password}}'
+        Name: !Join
+          - '-'
+          - - !Ref AWSTeam
+            - 02replica
+            - connector
+            - !If
+              - IsNotPrd
+              - !Ref AWSEnv
+              - !Ref 'AWS::NoValue'
+
+  GlueConnectorFoodOrdering:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Description: "Connect to Food Ordering database."
+        ConnectionType: "JDBC"
+        PhysicalConnectionRequirements:
+          SecurityGroupIdList:
+            - !Ref GlueSecurityGroupID
+          SubnetId: !Ref SubnetID
+        ConnectionProperties:
+          JDBC_CONNECTION_URL: !Join
+            - ''
+            - - 'jdbc:postgresql://'
+              - !Sub '{{resolve:secretsmanager:${SecretManagerNameFoodOrdering}:SecretString:host}}'
+              - ':'
+              - !Sub '{{resolve:secretsmanager:${SecretManagerNameFoodOrdering}:SecretString:port}}'
+              - '/'
+              - !Sub '{{resolve:secretsmanager:${SecretManagerNameFoodOrdering}:SecretString:dbname}}'
+          USERNAME: !Sub '{{resolve:secretsmanager:${SecretManagerNameFoodOrdering}:SecretString:username}}'
+          PASSWORD: !Sub '{{resolve:secretsmanager:${SecretManagerNameFoodOrdering}:SecretString:password}}'
+        Name: !Join
+          - '-'
+          - - !Ref AWSTeam
+            - foodordering
+            - connector
+            - !If
+              - IsNotPrd
+              - !Ref AWSEnv
+              - !Ref 'AWS::NoValue'
+  # Creating Glue Connection - End
+
+  # Creating Glue JDBC Crawler - Start
+  CrawlerJDBCshkpmallsVip:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - db02
+          - shkpmalls
+          - vipbi
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl shkpmalls_vip_bi data in db02
+      DatabaseName: !Ref GlueDB02replica
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueConnector02replica
+            Path: shkpmalls_vip_bi/%
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv
+      }
+
+  CrawlerJDBCshkpmallswechatanalytics:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - db02
+          - shkpmalls
+          - wechat
+          - analytics
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl shkpmalls_vip_bi data in db02
+      DatabaseName: !Ref GlueDB02replica
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueConnector02replica
+            Path: shkpmalls_wechat_analytics/%
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv
+      }
+
+  CrawlerJDBCBiDatamart:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - db02
+          - bi
+          - datamart
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl bi_datamart data in db02
+      DatabaseName: !Ref GlueDB02replica
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueConnector02replica
+            Path: bi_datamart/%
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv
+      }
+
+  CrawlerJDBCBiDimension:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - db02
+          - bi
+          - dimension
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl bi_dimension data in db02
+      DatabaseName: !Ref GlueDB02replica
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueConnector02replica
+            Path: bi_dimension/%
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv
+      }
+
+  CrawlerJDBCthepointWWW:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - db01
+          - thepoint
+          - www
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl thepoint-www data in db01
+      DatabaseName: !Ref GlueDB01replica
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueConnector01replica
+            Path: thepoint-www/%
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv
+      }
+
+  CrawlerJDBCfoodordering:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - magiccart
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl foodordering data in vendor DB
+      DatabaseName: !Ref GlueDBMagicCart
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueConnectorFoodOrdering
+            Path: magiccart_shkpmall/%
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv ,
+        stack: foodordering
+        }
+    # Creating Glue JDBC Crawler - End
+# Custom Resources on Env - End

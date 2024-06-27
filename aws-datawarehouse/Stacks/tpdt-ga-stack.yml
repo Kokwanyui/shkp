@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Stack to deploy resources and tasks for ga
+
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  DBprefix:
+    Type: String
+    Default: tp03
+  GlueIamRole:
+    Type: String
+  GlueVersion:
+    Type: String
+  GlueDBdw:
+    Type: String
+  S3ArtifactBucket:
+    Type: String
+  GluejobNumberOfWorkers:
+    Type: Number
+    Description: number of workers for Glue Job
+  S3NameGlueTemporary:
+    Type: String
+  lambdaIamRole:
+    Type: String
+  accountid:
+    Type: String
+
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+
+Resources:
+# Creating S3 Buckets - Start
+  S3ga:
+    Description: bucket to store ga big query result
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - ga
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: ga
+# Creating S3 Buckets - End
+
+# Creating Glue DataBase - Start
+  GlueDBga:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database to connect S3ga bucket
+        LocationUri: !Sub 's3://${S3ga}/'
+        Name: !Join
+          - '_'
+          - - !Ref AWSTeam
+            - 03ga
+            - !If
+              - IsNotPrd
+              - !Ref AWSEnv
+              - !Ref 'AWS::NoValue'
+# Creating Glue DataBase - End
+
+# Creating Glue S3 Crawler - Start
+  CrawlerS3ga:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - s3
+          - ga
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl ga data in S3
+      DatabaseName: !Ref GlueDBga
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${S3ga}/tpdt_ga_raw'
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv ,
+        stack: ga
+        }
+# Creating Glue S3 Crawler - End
+
+# Creating Glue Trigger - Start
+  gaCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - ga
+          - crawler
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "SCHEDULED"
+      Schedule: cron(45 16 * * ? *)
+      Description: "Trigger ga crawler"
+      StartOnCreation: true
+      Actions:
+        - CrawlerName: !Ref CrawlerS3ga
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: ga
+# Creating Glue Trigger- End
+
+# Creating Lambda Function - Start
+  GA4BigQueryDataExtraction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Extract ga4 data from big query
+      FunctionName: !Sub '${AWSTeam}-ga4-bigquery-data-extraction'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/ga4_bigquery_data_extraction.zip
+      Timeout: 900
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      ReservedConcurrentExecutions: 1
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: ga
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_google_auth:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_google_cloud_storage:1'
+
+  GA4BigQueryDataExtractionFullLoad:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Full Load of ga4 data from big query
+      FunctionName: !Sub '${AWSTeam}-ga4-bigquery-data-extraction-full-load'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/ga4_bigquery_data_extraction_full_load.zip
+      Timeout: 900
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      ReservedConcurrentExecutions: 1
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: ga
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_google_auth:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_google_cloud_storage:1'
+# Creating Lambda Function - End
+
+  GA4BigQueryDataExtractionScheduleEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: "cron(15 16 * * ? *)"
+      State: "ENABLED"
+      Name: !Sub '${AWSTeam}-lambda-GA4BigQueryDataExtraction'
+      Targets:
+        - Arn: !GetAtt GA4BigQueryDataExtraction.Arn
+          Id: 'GA4BigQueryDataExtraction'
+          Input: !Sub '{"env": "${AWSEnv}"}'
+
+  GA4BigQueryDataExtractionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GA4BigQueryDataExtraction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt GA4BigQueryDataExtractionScheduleEvent.Arn
+

@@ -1,0 +1,183 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType, FloatType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.window import Window
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+ 
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-cdp-dw/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    secret_name = "tpdt_cdp_redshift"
+    tmpdir = "s3://tpdt-data-from-cdp/redshift_tmpdir/"
+    artifacts_s3 = "tpdt-artifacts"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-adobe-dw-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    secret_name = f'tpdt_cdp_redshift_{env}'
+    tmpdir = f"s3://tpdt-data-from-cdp-{env}/redshift_tmpdir/"
+    artifacts_s3 = "tpdt-artifacts-{env}"
+
+
+dimension_prefix = 'bi_dimension_'
+prefix="shkpmalls_vip_"
+
+client = boto3.client('secretsmanager')
+response = client.get_secret_value(SecretId=secret_name)
+secret = json.loads(response['SecretString'])
+    
+username = secret["username"]
+pw = secret["password"]
+host = secret["host"]
+port = secret["port"]
+db = secret["dbname"]
+
+yesterday = datetime.now() - timedelta(1)
+yesterday_string = datetime.strftime(yesterday, '%Y-%m-%d')
+
+# UDFs
+def inital_load(schema, table):
+    # Redshift Connection Config
+    my_conn_options = {  
+        "url": f"jdbc:redshift://{host}:{port}/{db}",
+        "dbtable": f'{schema}.{table}',
+        "user": username,
+        "password": pw,
+        "customJdbcDriverS3Path": f"s3://{artifacts_s3}/Glue/PythonLibraries/redshift-jdbc42-2.1.0.1.jar",
+        "customJdbcDriverClassName": "com.amazon.redshift.Driver",
+        "sslMode": "DISABLED",
+        "redshiftTmpDir": tmpdir
+    }
+    
+    # Read Data from CDP Redshift
+    source_dydf = glueContext.create_dynamic_frame.from_options(connection_type = "redshift", connection_options = my_conn_options)
+    source_df = source_dydf.toDF()
+    return source_df
+
+def delta_load(query):
+    # Read Data from CDP Redshift
+    source_dydf = glueContext.read.format("jdbc")\
+    .option("url",f"jdbc:redshift://{host}:{port}/{db}")\
+    .option("user",username)\
+    .option("password",pw)\
+    .option("dbtable",query)\
+    .load()
+    return source_dydf
+    
+# tables to extract
+# Extract Delivery_date---------------------------------------------------------------------------------------------------
+# Table: global_customer_linkage -----------------------------------------------------------------------------------------
+linkage_table = 'global_customer_linkage'
+linkage_schema = 'shkp-curated-ext'
+linkage_query="""(select lobmemid.BU_TPT as member_id, 
+case when len(lobmemid.BU_SMT)>0 then 1 else 0 end as SMT,
+case when len(lobmemid.BU_KMB)>0 then 1 else 0 end as KMB,
+case when len(lobmemid.BU_HY)>0 then 1 else 0 end as HY, 
+case when len(lobmemid.BU_KS)>0 then 1 else 0 end as KS, 
+case when len(lobmemid.BU_GR)>0 then 1 else 0 end as GR, 
+createdttm,  lastupddttm from "shkp-curated-ext".global_customer_linkage  
+where len(lobmemid.BU_TPT)> 0) as t1"""
+
+df = delta_load(linkage_query)
+df.createOrReplaceTempView("customer_linkage")
+
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member', transformation_ctx = "member")
+member_df = t_member.toDF().select('member_id').filter("status not in ('S', 'V', 'X', 'W')")
+member_df.createOrReplaceTempView("member")
+
+yata_df = spark.read.csv("s3://tpdt-data-from-cdp/yata_overlap/yata_overlap_member_id.csv", header='true', inferSchema='true', sep=',')
+yata_df.createOrReplaceTempView("yata")
+
+overlap_df = spark.sql("""
+Select Distinct t1.member_id,
+t2.SMT, 
+case when t3.member_id is not null then 1 else 0 end as YATA,
+case when t2.KMB = 1 then 1 else 0 end as KMB,
+case when t2.HY = 1 then 1 else 0 end as HY,
+case when t2.KS = 1 then 1 else 0 end as KS,
+case when t2.GR = 1 then 1 else 0 end as GR,
+t2.createdttm as cdp_created_datetime,  
+t2.lastupddttm as cdp_updated_datetime
+from member t1
+left join customer_linkage t2 on t1.member_id = t2.member_id
+left join yata t3 on t1.member_id = t3.member_id
+""")
+
+overlap_output_path = f"s3://tpdt-cdp-dw/member_overlap/"
+overlap_df.write.format('parquet').mode('overwrite').option("header",True).save(overlap_output_path)
+
+
+# Table: global_customer_linkage -----------------------------------------------------------------------------------------
+attribute_table = 'lob_customer_attribute_vw'
+attribute_schema = 'shkp_curated_ext_rls'
+
+attribute_df = inital_load(attribute_schema, attribute_table)
+attribute_df = attribute_df.withColumn('PartitionKey', col('cat'))\
+                           .withColumn('createdttm', to_date(col('createdttm').substr(1,10),'yyyy-MM-dd'))\
+                           .withColumn('lastupddttm', to_date(col('lastupddttm').substr(1,10),'yyyy-MM-dd'))\
+                           .withColumn('createDate', to_date(col('createDate').substr(1,10),'yyyy-MM-dd'))\
+                           .withColumn('endDate', to_date(col('endDate').substr(1,10),'yyyy-MM-dd'))
+ 
+
+attribute_output_path=f"s3://tpdt-cdp-dw/customer_attribute/"
+attribute_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header",True).save(attribute_output_path)
+
+# Table: rfm -----------------------------------------------------------------------------------------
+def rfm():
+    rfm_table = 'lob_rfm_vw'
+    rfm_schema = 'shkp_curated_ext_rls'
+    
+    rfm_df = inital_load(rfm_schema, rfm_table)
+    rfm_df = rfm_df.withColumn('recency', col('recency').cast(IntegerType()))\
+                   .withColumn('frequency', col('frequency').cast(IntegerType()))\
+                   .withColumn('monetary', col('monetary').cast(FloatType()))\
+                   .withColumn('monetary_rank', col('monetary_rank').cast(FloatType()))\
+                   .withColumn('frequency_rank', col('frequency_rank').cast(FloatType()))\
+                   .withColumn('monetary_quintile', col('monetary_quintile').cast(IntegerType()))\
+                   .withColumn('frequency_quintile', col('frequency_quintile').cast(IntegerType()))\
+                   .withColumn('fm_label', col('fm_label').cast(IntegerType()))\
+                   .withColumn('is_lifestyler', col('is_lifestyler').cast(IntegerType()))\
+                   .withColumn('p_days', col('p_days').cast(IntegerType()))\
+                   .withColumn('ref_date', to_date(col('ref_date').substr(1,10),'yyyy-MM-dd'))\
+                   .withColumn('PartitionKey', col('ref_date'))
+        
+    rfm_output_path=f"s3://tpdt-cdp-dw/rfm/"
+    rfm_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header",True).save(rfm_output_path)
+
+if yesterday_string[-2:]=='15':
+    rfm()
+else:
+    pass
+

@@ -1,0 +1,181 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+from dateutil.relativedelta import relativedelta
+from pyspark.sql.window import Window
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path = "s3://tpdt-dw/"
+    tmp_csv_path= "s3://tpdt-adhoc/"
+    tmp_bucket = "tpdt-adhoc"
+else:
+    db03="tpdt_03dw_"+env
+    db02="tpdt_02replica"+env
+    output_path = f"s3://tpdt-dw-{env}/"
+    tmp_csv_path= f"s3://tpdt-adhoc-{env}/"
+    tmp_bucket = f"tpdt-adhoc-{env}"
+    
+prefix03 = 'tpdt_'
+bi_prefix = 'bi_datamart_'
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : dw_spending
+t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "dw_spending")
+spending_df = t_dw_spending.toDF()
+
+##source table : past professional buyer
+staging_file = 'professional_buyer_specific_list.csv'
+staging_filepath = tmp_csv_path+staging_file 
+delete_file = boto3.resource('s3',region_name='ap-east-1')
+delete_file.Object(tmp_bucket,staging_file).delete()
+
+t_pb_previous = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'professional_buyer_specific_list', transformation_ctx = "ods_professional_buyer_specific_list")
+pb_tmp_df= t_pb_previous.toDF().toPandas()
+pb_tmp_df.to_csv(staging_filepath, sep=',', index=False)
+pb_previous_df = spark.read.csv(staging_filepath, header='true', inferSchema='true', sep=',')
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation ------------------------------------------------------------------------------------------------------------------------------
+'''
+Criteria to identify Professional Buyer:
+(1)
+a. >= 80% spending on 1 trade category &
+b. >= 1 transaction per month on that trade category &
+c. >= 70% transaction in this category & <- this criteria is according to SQL stored prod script
+d. >= 20K monthly spending
+in last 12 months
+
+(2)
+a. >= 80% spending on 1 trade category &
+b. >= 2 transaction per month(for AV / J&W/ F&A); >=3 transactions per month (for C&M) &
+c. >= 70% transaction in this category & <- this criteria is according to SQL stored prod script
+d. >= 10K monthly spending
+in last 12 months
+'''
+
+
+today = datetime.date.today()
+end_date = today.replace(day=1) - datetime.timedelta(days=1)
+p12m = end_date - relativedelta(months=11)
+start_date = p12m.replace(day=1)
+end_date_str = str(end_date)
+start_date_str = str(start_date)
+
+criteria1_amount = 20000
+criteria2_amount = 10000
+
+# Cleaning dw_spending
+dw_spending_df = spending_df.select('member_id',
+                                             'receipt_id',
+                                             'receipt_transaction_date',
+                                             date_format(col('receipt_transaction_date'), "yyyy-MM").alias("transaction_yearmonth"), 
+                                             'receipt_amount', 
+                                             'lms_standard_trade_category') \
+                                         .filter("member_status_detail not in ('Invalid','Suspended','Waiting for verification')")\
+                                         .filter("member_id not in ('SHKP0519009')")\
+                                         .filter(f"receipt_transaction_date between '{start_date_str}' and '{end_date_str}'")\
+                                         .withColumn('lms_standard_trade_category', when(col('lms_standard_trade_category')=='AV','AV Instrument')\
+                                                                                    .when(col('lms_standard_trade_category')=='Services / Leisure / Education & Others','AV Instrument')\
+                                                                                    .otherwise(col('lms_standard_trade_category')))
+
+dw_spending_df.persist()
+
+pb_basic_stats = dw_spending_df.groupby('member_id').agg(sum('receipt_amount').alias('total_amount'), count('receipt_id').alias('total_transaction'), min('receipt_transaction_date').alias('first_purchase_date'))\
+                               .select(col('member_id').alias('mapping_member_id'), 'total_amount', 'total_transaction',  'first_purchase_date')
+pb_criteria = pb_basic_stats.withColumn('transaction_requirement', when(round(months_between(lit(end_date_str),col('first_purchase_date')),0)<=6,6).otherwise(round(months_between(lit(end_date_str),col('first_purchase_date')),0)))
+
+# To identify pb in criteria 1
+pb1 = dw_spending_df.groupby('member_id', 'lms_standard_trade_category').agg(sum('receipt_amount').alias('trade_cat_amount'), count('receipt_id').alias('trade_cat_transaction'))\
+                        .filter("lms_standard_trade_category not in ('Food & Beverage','Supermarket / Convenience Store','Department Stores','Furniture / Household','Cinema','Entertainment')")
+
+pb1 = pb1.join(pb_criteria, pb_criteria.mapping_member_id == pb1.member_id, how='left')\
+                 .filter("trade_cat_amount >= 0.8 * total_amount and trade_cat_transaction >= transaction_requirement and trade_cat_transaction >= 0.7 * total_transaction")\
+                 .filter(f"total_amount >= transaction_requirement * {criteria1_amount}")\
+                 .select('member_id').distinct()
+
+
+# To identify pb in criteria 2
+pb2 = dw_spending_df.groupby('member_id', 'lms_standard_trade_category').agg(sum('receipt_amount').alias('trade_cat_amount'), count('receipt_id').alias('trade_cat_transaction'))\
+                        .filter("lms_standard_trade_category not in ('Food & Beverage','Supermarket / Convenience Store','Department Stores','Furniture / Household','Cinema','Entertainment')")\
+                        .withColumn('trade_cat_reqest_multiplier', when(col('lms_standard_trade_category') == 'Cosmetics, Personal care & Medical Products', lit(3)).otherwise(lit(2)))
+
+pb2 = pb2.join(pb_criteria, pb_criteria.mapping_member_id == pb1.member_id, how='left')\
+                 .filter("trade_cat_amount >= 0.8 * total_amount and trade_cat_transaction >= transaction_requirement * trade_cat_reqest_multiplier and trade_cat_transaction >= 0.7 * total_transaction")\
+                 .filter(f"total_amount >= transaction_requirement * {criteria2_amount}")\
+                 .select('member_id').distinct()
+
+
+pb = pb1.union(pb2).withColumn('period',lit(end_date)).distinct()
+
+final_pb = pb_previous_df.union(pb).distinct()\
+                         .withColumn('period', col('period').cast(DateType()))
+
+incremental_pb_staging1 = final_pb.groupby(col('member_id').alias('mapping_member_id')).agg(min('period').alias('period'))\
+                                  .withColumn('p1y', date_sub(col('period'), 365).cast(DateType()))
+
+incremental_pb_staging2 = spending_df.join(incremental_pb_staging1, spending_df.member_id == incremental_pb_staging1.mapping_member_id, how='inner')\
+                                     .select('member_id', 'lms_standard_trade_category', 'period', 'receipt_transaction_date', 'receipt_amount')\
+                                     .filter("receipt_transaction_date between p1y and period")\
+                                     .withColumn('buyer_type', when(col('lms_standard_trade_category')=='AV','AV Instrument')\
+                                                                                    .when(col('lms_standard_trade_category')=='Services / Leisure / Education & Others','AV Instrument')\
+                                                                                    .otherwise(col('lms_standard_trade_category')))
+
+
+incremental_pb_staging3 = incremental_pb_staging2.groupby('member_id', 'period', 'buyer_type').agg(sum('receipt_amount').alias('total_spend'))
+
+windowSpec  = Window.partitionBy('member_id').orderBy(col('total_spend').desc())
+incremental_pb_staging4 = incremental_pb_staging3.withColumn('ranked', row_number().over(windowSpec))
+incremental_pb_staging4 = incremental_pb_staging4.filter("ranked = 1")
+
+incremental_pb_final = incremental_pb_staging4.select('member_id', 'period', 'buyer_type')\
+                                              .withColumn('professional_buyers', when(col('period')==lit('2020-03-31'),lit('Locked Base - As of 2020 Mar')).otherwise(concat(lit('Incremental - ') , date_format(col('period') ,'yyyy MMM'))))
+
+
+print("Saving Result into target destination...")
+pb_output_path = output_path+f"/tpdt_professional_buyer_specific_list/"
+final_pb.write.format('parquet').mode('overwrite').option("header",True).save(pb_output_path)
+
+incremental_pb_output_path = output_path+f"/tpdt_professional_buyer_incremental_list/"
+incremental_pb_final.write.format('parquet').mode('overwrite').option("header",True).save(incremental_pb_output_path)
+print(f"Result Saved in {pb_output_path}, {incremental_pb_output_path}...")
+
+
+
+
+
+
+
+
+
+
+

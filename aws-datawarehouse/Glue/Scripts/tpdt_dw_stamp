@@ -1,0 +1,248 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db03sub = "tpdt_03sub"
+    db03stamp="tpdt_03stampmission"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-stampmission/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub = "tpdt_03sub_"+env
+    output_path="s3://tpdt-stampmission-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+prefix03="tpdt_"
+dimension_prefix = "bi_dimension_"
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : tpdt_staging_stamp_gift_list
+t_tpdt_staging_stamp_gift_list = glueContext.create_dynamic_frame.from_catalog(database = db03stamp, table_name = 'tpdt_ods_stamp_gift_list', transformation_ctx = "tpdt_staging_stamp_gift_list")
+tpdt_staging_stamp_gift_list_df = t_tpdt_staging_stamp_gift_list.toDF()
+tpdt_staging_stamp_gift_list_df.createOrReplaceTempView("tpdt_staging_stamp_gift_list")
+print("Source Extraxtion Finished: tpdt_staging_stamp_gift_list...")
+
+##source table : tpdt_staging_stamp_shop_list
+t_tpdt_staging_stamp_shop_list = glueContext.create_dynamic_frame.from_catalog(database = db03stamp, table_name = 'tpdt_ods_stamp_shop_list', transformation_ctx = "tpdt_staging_stamp_shop_list")
+tpdt_staging_stamp_shop_list_df = t_tpdt_staging_stamp_shop_list.toDF()
+tpdt_staging_stamp_shop_list_df.createOrReplaceTempView("tpdt_staging_stamp_shop_list")
+print("Source Extraxtion Finished: tpdt_staging_stamp_shop_list...")
+
+##source table : tpdt_staging_stamp_detail
+t_tpdt_staging_stamp_detail = glueContext.create_dynamic_frame.from_catalog(database = db03stamp, table_name = 'tpdt_ods_stamp_detail', transformation_ctx = "tpdt_staging_stamp_detail")
+tpdt_staging_stamp_detail_df = t_tpdt_staging_stamp_detail.toDF()
+tpdt_staging_stamp_detail_df.createOrReplaceTempView("tpdt_staging_stamp_detail")
+print("Source Extraxtion Finished: tpdt_staging_stamp_detail...")
+
+
+##source table : tpdt_staging_stamp_earn
+t_tpdt_staging_stamp_earn = glueContext.create_dynamic_frame.from_catalog(database = db03stamp, table_name = 'tpdt_ods_stamp_earn', transformation_ctx = "tpdt_staging_stamp_earn")
+tpdt_staging_stamp_earn_df = t_tpdt_staging_stamp_earn.toDF()
+tpdt_staging_stamp_earn_df.createOrReplaceTempView("tpdt_staging_stamp_earn")
+print("Source Extraxtion Finished: tpdt_staging_stamp_earn...")
+
+##source table : tpdt_staging_stamp_redemption
+t_tpdt_staging_stamp_redemption = glueContext.create_dynamic_frame.from_catalog(database = db03stamp, table_name = 'tpdt_ods_stamp_redemption', transformation_ctx = "tpdt_staging_stamp_redemption")
+tpdt_staging_stamp_redemption_df = t_tpdt_staging_stamp_redemption.toDF()
+tpdt_staging_stamp_redemption_df.createOrReplaceTempView("tpdt_staging_stamp_redemption")
+print("Source Extraxtion Finished: tpdt_staging_stamp_redemption...")
+
+##source table : tpdt_staging_stamp_receipt_id
+t_tpdt_staging_stamp_receipt_id = glueContext.create_dynamic_frame.from_catalog(database = db03stamp, table_name = 'tpdt_ods_stamp_receipt_id', transformation_ctx = "tpdt_staging_stamp_receipt_id")
+tpdt_staging_stamp_receipt_id_df = t_tpdt_staging_stamp_receipt_id.toDF()
+tpdt_staging_stamp_receipt_id_df.createOrReplaceTempView("tpdt_staging_stamp_receipt_id")
+print("Source Extraxtion Finished: tpdt_staging_stamp_receipt_id...")
+
+##source table : dw_spending
+t_tpdt_dw_spending = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = 'tpdt_dw_spending', transformation_ctx = "tpdt_dw_spending")
+tpdt_dw_spending_df = t_tpdt_dw_spending.toDF()
+tpdt_dw_spending_df.createOrReplaceTempView("dw_spending")
+print("Source Extraxtion Finished: tpdt_dw_spending...")
+
+##source table : dw_gift_inventory
+t_tpdt_dw_gift_inventory = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = 'tpdt_dw_gift_inventory', transformation_ctx = "tpdt_dw_gift_inventory")
+tpdt_dw_gift_inventory_df = t_tpdt_dw_gift_inventory.toDF()
+tpdt_dw_gift_inventory_df.createOrReplaceTempView("tpdt_dw_gift_inventory")
+print("Source Extraxtion Finished: tpdt_dw_gift_inventory...")
+
+##source table : staging_member
+t_staging_member = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = 'tpdt_staging_member', transformation_ctx = "tpdt_staging_member")
+staging_member_df = t_staging_member.toDF()
+staging_member_df.createOrReplaceTempView("staging_member")
+print("Source Extraxtion Finished: staging_member...")
+
+##source table : staging_shop
+t_staging_shop = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = 'tpdt_staging_shop', transformation_ctx = "tpdt_staging_shop")
+staging_shop_df = t_staging_shop.toDF()
+staging_shop_df.createOrReplaceTempView("staging_shop")
+print("Source Extraxtion Finished: staging_shop...")
+
+## mapping table : dim_tp_mall_mapping.csv
+if env == 'prod':
+    t_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_mall_mapping', transformation_ctx = "dim_mall_mapping")
+    mall_mapping_df = t_mall_mapping.toDF()
+else:
+    mall_mapping_df = spark.read.csv(dimension_path + 'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv', header='true', inferSchema='true', sep=',')
+mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+print("Source Extraxtion Finished: dim_tp_mall_mapping.csv...")
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Tranformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+dw_stamp_gift_inventory = spark.sql("""
+select t1.stamp_program_id ,t2.title_en,t2.stamp_desc_en ,
+case when isPhysicalGift='' then 1 else 0 end as PointOrGift,
+t1.isPoint ,t1.isPhysicalGift ,stampRequire , approvalRequire ,
+team, property_id, item_type, gift_status, gift_status_detail, 
+case when created_datetime is null  then t2.createtime else created_datetime end as create_datetime ,
+case when name_en is null then banner_desc_en else  name_en end as name_en, 
+case when name_tc is null then banner_desc_tc else  name_en end as name_tc, 
+name_sc, gift_type, sub_gift_type, gift_unit_cost,
+case when redemption_date_start  is null then datefrom_gift else redemption_date_start  end as redemption_date_start , 
+case when  redemption_date_end is null then dateto_gift else redemption_date_end  end as redemption_date_end ,
+required_redeem_bonus_point , stock_at_property_id, original_stock_level, physical_stock_level, redeemed_stock_level, collected_or_used_stock_level, stock_level_available_for_redemption
+from tpdt_staging_stamp_gift_list       t1 
+left  join tpdt_staging_stamp_detail    t2 on t1.stamp_program_id=t2.stamp_program_id
+left  join tpdt_dw_gift_inventory       t3 on t1.isPhysicalGift=t3.gift_id
+""")
+
+dw_stamp_shop_list = spark.sql("""
+select distinct t1.stamp_program_id , t1.shopid , shop_name ,  team , property_id ,lms_trade_name , lms_standard_brand_name , lms_standard_trade_category
+From tpdt_staging_stamp_shop_list t1 
+left join staging_shop t2 on t1.mallid=t2.mall_id and t1.shopid=t2.mapping_shop_id
+where stamp_program_id<>0 
+""")
+
+dw_stamp_redemption = spark.sql("""
+select t1.member_id,  t1.stamp_program_id , t1.PointOrGift  , 
+isPhysicalGift , isPoint ,
+gift_stamp_required , t2.team  ,t2.property_id, gift_btn_text_en ,gift_btn_text_tc , redeem_status , 
+to_date(t1.redeem_date) as redeem_date ,recordtime ,
+datediff(to_date(t1.redeem_date) , datefrom_gift ) +1 as  day_since_collection_start ,
+t4.gender  ,t4.age ,t4.age_group ,t4.residence  ,t4.district
+from tpdt_staging_stamp_redemption t1
+left join  dim_tp_mall_mapping                   t2 on t1.pickup_mall_id=t2.mall_id
+left join  tpdt_staging_stamp_detail                        t3 on t1.stamp_program_id=t3.stamp_program_id
+left join staging_member                t4 on t1.member_id=t4.mapping_member_id
+""")
+
+dw_stamp_member_spend = spark.sql("""
+select
+t1.member_id ,  t1.stamp_program_id , t3.title_en , t1.stamp_transaction_id , t1.receipt_id , t2.receipt_transaction_date , t2.team , t2.property_id ,
+t2.gender  ,t2.age ,t2.age_group ,t2.residence ,t2.district , t2.district_cs ,t2.shop_name ,t2.lms_standard_brand_name ,t2.lms_standard_trade_category ,
+t2.receipt_amount ,t2.earned_points ,t4.earn_stamp
+from  tpdt_staging_stamp_receipt_id     t1
+left join dw_spending       t2 on t1.receipt_id =t2.receipt_id
+left join tpdt_staging_stamp_detail     t3 on t1.stamp_program_id = t3.stamp_program_id
+left join tpdt_staging_stamp_earn		t4 on t1.stamp_transaction_id=t4.stamp_transaction_id
+""")
+dw_stamp_member_spend.createOrReplaceTempView("dw_stamp_member_spend")
+
+tmp_test_spending_summary = spark.sql("""
+select member_id ,stamp_transaction_id ,stamp_program_id,
+count(distinct receipt_id) as no_receipt,
+min(receipt_transaction_date) as receipt_date_min ,
+max(receipt_transaction_date) as receipt_date_max,
+SUM(receipt_amount) as total_receipt_amount,
+concat_ws('|', collect_list(distinct  property_id)) as property_group
+from dw_stamp_member_spend
+group by member_id ,stamp_transaction_id ,stamp_program_id
+""")
+tmp_test_spending_summary.createOrReplaceTempView("tmp_test_spending_summary")
+
+tmp_stamp_earn_agg = spark.sql("""
+select member_id , stamp_program_id ,stamp_transaction_id , to_date(lastupdate)as updated_date ,sum(earn_stamp) as stamps_earn
+from tpdt_staging_stamp_earn
+group by  member_id , stamp_program_id , stamp_transaction_id , to_date(lastupdate)
+""")
+tmp_stamp_earn_agg.createOrReplaceTempView("tmp_stamp_earn_agg")
+
+
+dw_stamp_earn = spark.sql("""
+select t1.member_id ,
+t4.gender ,t4.age ,t4.age_group ,t4.residence ,t4.district , t4.district_cs, t4.registration_date  ,
+t1.stamp_program_id , t1.stamp_transaction_id ,
+t5.title_en ,
+to_date(lastupdate) as stamp_last_updated_date ,
+t3.stamps_earn ,
+coalesce(t2.no_receipt,0) as no_receipt,
+t2.receipt_date_min ,
+t2.receipt_date_max,
+datediff( t2.receipt_date_max , t5.datefrom_collect     )+1  as day_since_program_start ,
+t2.total_receipt_amount,
+t2.property_group
+from tpdt_staging_stamp_earn            t1
+left join tmp_test_spending_summary     t2 on t1.stamp_transaction_id =t2.stamp_transaction_id and  t1.stamp_program_id =t2.stamp_program_id and t1.member_id =t2.member_id
+left join tmp_stamp_earn_agg            t3 on t1.member_id=t3.member_id and t1.stamp_program_id=t3.stamp_program_id  and  t1.stamp_transaction_id=t3.stamp_transaction_id and to_date(t1.lastupdate) = t3.updated_date
+left join staging_member                t4 on t1.member_id=t4.mapping_member_id
+left join tpdt_staging_stamp_detail     t5 on t1.stamp_program_id = t5.stamp_program_id
+where t3.stamps_earn >0 and cast(t2.receipt_date_max as date)>=t5.datefrom_collect
+""")
+## Data Tranformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+dw_stamp_gift_inventory.write.format('parquet').mode('overwrite').option("header",True).save(output_path+prefix03+'dw_stamp_gift_inventory/')
+
+dw_stamp_shop_list.write.format('parquet').mode('overwrite').option("header",True).save(output_path+prefix03+'dw_stamp_shop_list/')
+
+dw_stamp_redemption.write.format('parquet').mode('overwrite').partitionBy("stamp_program_id").option("header",True).save(output_path+prefix03+'dw_stamp_redemption/')
+
+dw_stamp_member_spend.write.format('parquet').mode('overwrite').partitionBy("stamp_program_id").option("header",True).save(output_path+prefix03+'dw_stamp_member_spend/')
+
+dw_stamp_earn.write.format('parquet').mode('overwrite').partitionBy("stamp_program_id").option("header",True).save(output_path+prefix03+'dw_stamp_earn/')
+
+tmp_test_spending_summary.write.format('parquet').mode('overwrite').option("header",True).save(staging_path+prefix03+'dw_stamp_earn/')
+print("Saved Results into target destination...")
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+

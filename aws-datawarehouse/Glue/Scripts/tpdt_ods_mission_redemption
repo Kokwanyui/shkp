@@ -1,0 +1,53 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType 
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta 
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+db01="tpdt_01replica_"+env
+prefix="shkpmalls_stamp_"
+output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+
+
+## Source Extraction
+##source table : mission_redemption
+t_mission_redemption = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'mission_redemption', transformation_ctx = "mission_redemption")
+mission_redemption_df = t_mission_redemption.toDF()
+print("Source Extraxtion Finished: mission_redemption...")
+
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+
+## Loading Result to S3
+print("Saving Result into target destination...")
+
+mission_redemption_df.write.format('parquet').partitionBy("missionid").mode('overwrite').option("header",True).save(output_path)
+
+print(f"Result Saved in {output_path}...")
+
+
+job.commit()

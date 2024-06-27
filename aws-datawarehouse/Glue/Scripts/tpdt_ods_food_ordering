@@ -1,0 +1,246 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import re
+from datetime import datetime, date, time, timezone,timedelta 
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    db02="tpdt_02replica"
+    food_db="tpdt_magiccert"
+    output_path="s3://tpdt-foodordering/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    bi_prefix = 'bi_datamart_'
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-foodordering-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    foodorder_path="s3://tpdt-foodordering-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+prefix03 = 'tpdt_'
+dimension_prefix = "bi_dimension_"
+food_prefix = "magiccart_shkpmall_public_"
+
+
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : ods_food_order_detail
+if env == 'prod':
+    ods_food_order_detail_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'order_detail', transformation_ctx = "order_detail").toDF()
+    ods_food_order_header_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'order_header', transformation_ctx = "order_header").toDF()\
+                                                                                                                                                                              .filter(col('invoice_no')\
+                                                                                                                                                                              .like('%S%'))\
+                                                                                                                                                                              .filter(col('invoice_no')\
+                                                                                                                                                                              .like('%M%'))
+    ods_food_order_payment_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'order_payment', transformation_ctx = "order_payment").toDF()
+    ods_food_order_company_profile_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'company_profile', transformation_ctx = "company_profile").toDF()
+    ods_food_order_gift_redemption_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'gift_redemption', transformation_ctx = "gift_redemption").toDF()
+    ods_food_order_gift_redemption_coupon_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'gift_redemption_coupon', transformation_ctx = "gift_redemption_coupon").toDF()
+    ods_food_order_product_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'product', transformation_ctx = "product").toDF()
+    ods_food_order_product_category_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'product_category', transformation_ctx = "product_category").toDF()
+    ods_food_order_product_feature_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'product_feature', transformation_ctx = "product_feature").toDF()
+    ods_food_order_product_option_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'product_option', transformation_ctx = "product_option").toDF()
+    ods_food_order_product_option_d_df = glueContext.create_dynamic_frame.from_catalog(database = food_db, table_name = food_prefix+'product_option_d', transformation_ctx = "product_option_d").toDF()
+else: 
+    ods_food_order_detail_df = spark.read.csv(foodorder_path+'ods_food_order_detail/ods_food_order_detail.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_header_df = spark.read.csv(foodorder_path+'ods_food_order_header/ods_food_order_header.csv', header='true', inferSchema='true', sep=',').filter(col('invoice_no').like('%S%')).filter(col('invoice_no').like('%M%'))
+    ods_food_order_payment_df = spark.read.csv(foodorder_path+'ods_food_order_payment/ods_food_order_payment.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_company_profile_df = spark.read.csv(foodorder_path+'ods_food_order_company_profile/ods_food_order_company_profile.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_gift_redemption_df = spark.read.csv(foodorder_path+'ods_food_order_gift_redemption/ods_food_order_gift_redemption.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_gift_redemption_coupon_df = spark.read.csv(foodorder_path+'ods_food_order_gift_redemption_coupon/ods_food_order_gift_redemption_coupon.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_product_df = spark.read.csv(foodorder_path+'ods_food_order_product/ods_food_order_product.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_product_category_df = spark.read.csv(foodorder_path+'ods_food_order_product_category/ods_food_order_product_category.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_product_feature_df = spark.read.csv(foodorder_path+'ods_food_order_product_feature/ods_food_order_product_feature.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_product_option_df = spark.read.csv(foodorder_path+'ods_food_order_product_option/ods_food_order_product_option.csv', header='true', inferSchema='true', sep=',')
+    ods_food_order_product_option_d_df = spark.read.csv(foodorder_path+'ods_food_order_product_option_d/ods_food_order_product_option_d.csv', header='true', inferSchema='true', sep=',')
+
+
+##mapping table : shop
+t_shop= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_shop', transformation_ctx = "staging_shop")
+shop_df = t_shop.toDF().select('mapping_shop_id', 'shop_name' , 'lms_standard_brand_name')
+print("Source Extraxtion Finished: shop...")
+
+##mapping table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_member', transformation_ctx = "staging_member")
+member_df = t_member.toDF().select('mapping_member_id', 'member_status_detail')
+
+## mapping table : dim_mall_mapping
+t_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_mall_mapping', transformation_ctx = "dim_mall_mapping")
+mall_mapping_df = t_mall_mapping.toDF().select(col('mall_id').alias('mapping_mall_id'),'property_id', 'team')
+print("Source Extraction Finished: dim_tp_mall_mapping...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+def order_status_mapping(status):
+    if status == 0:
+        detail = 'Cancelled Order'
+    elif status == 1:
+        detail = 'Waiting Payment Confirmation'
+    elif status == 2:
+        detail = 'Processing Order'
+    elif status == 12:
+        detail = 'Ready for Pickup'
+    elif status == 99:
+        detail = 'Order Completed'
+    else:
+        detail = ''
+    return detail
+    
+order_status_udf= udf(order_status_mapping, StringType())
+
+def payment_status_mapping(status):
+    if status == 0:
+        detail = 'Waiting Payment Confirmation'
+    elif status == 1:
+        detail = 'Payment Confirmed'
+    elif status == -1:
+        detail = 'Not Confirmed Status'
+    else:
+        detail = ''
+    return detail
+
+payment_status_udf= udf(payment_status_mapping, StringType())
+
+tmp_food_order_header = ods_food_order_header_df.select('invoice_no',
+                                                        'purchase_date',
+                                                        'create_date',
+                                                        col('status').alias('order_status'),
+                                                        'last_update_by',
+                                                        'paid_amount',
+                                                        'original_amount' ,
+                                                        'sales_amount',
+                                                        'earn_cash_dollar',
+                                                        'earn_bonus_point',
+                                                        'item_qty',
+                                                        split(col('invoice_no'), '[MS]').getItem(1).cast(IntegerType()).alias('mall_id'),
+                                                        split(col('invoice_no'), '[MS]').getItem(2).cast(IntegerType()).alias('shop_id'),
+                                                        col('pickup_location').cast(StringType()).alias('pickup_location'),
+                                                        col('member_no').alias('member_id'),
+                                                        'last_update_date')\
+                                                .withColumn('updated_purchase_datetime', col('purchase_date') + expr('INTERVAL 8 HOURS'))\
+                                                .withColumn('updated_create_datetime', col('create_date') + expr('INTERVAL 8 HOURS'))\
+                                                .withColumn('updated_last_update_datetime', col('last_update_date') + expr('INTERVAL 8 HOURS'))\
+                                                .withColumn('order_status_detail', order_status_udf(col('last_update_date')))\
+                                                .withColumn('updated_purchase_date', to_date(col('create_date') + expr('INTERVAL 8 HOURS')))\
+                                                .withColumn('discount_amount', col('original_amount') - col('sales_amount'))\
+                                                .withColumn('cancel_datetime', when(col('order_status')==0, col('last_update_date')).otherwise(lit(None)))
+
+tmp_food_order_payment = ods_food_order_payment_df.select(col('invoice_no').alias('mapping_invoice_no'),
+                                                          'payment_status',
+                                                          'payment_code', 
+                                                          'payment_name',
+                                                          'pay_method')\
+                                                          .withColumn('payment_status_detail', payment_status_udf(col('payment_status')))
+
+food_order_header_detail = tmp_food_order_header.join(tmp_food_order_payment, tmp_food_order_payment.mapping_invoice_no == tmp_food_order_header.invoice_no, how='left')\
+                                                .join(mall_mapping_df, mall_mapping_df.mapping_mall_id == tmp_food_order_header.mall_id, how='left')\
+                                                .join(shop_df, shop_df.mapping_shop_id == tmp_food_order_header.shop_id, how='left')\
+                                                .join(member_df, member_df.mapping_member_id == tmp_food_order_header.member_id, how='inner')
+
+dw_food_order_header = food_order_header_detail.select('invoice_no',
+                                                       'team',
+                                                       'mall_id',
+                                                       'property_id',
+                                                       'shop_id',
+                                                       'shop_name',
+                                                       'lms_standard_brand_name',
+                                                       col('updated_purchase_datetime').alias('purchase_datetime'),
+                                                       col('updated_create_datetime').alias('create_datetime'),
+                                                       col('updated_purchase_date').alias('purchase_date'),
+                                                       'cancel_datetime', 
+                                                       'order_status',
+                                                       'order_status_detail' ,
+                                                       col('updated_last_update_datetime').alias('last_update_datetime'),
+                                                       'last_update_by' ,
+                                                       'member_id' , 
+                                                       'member_status_detail',
+                                                       'original_amount',
+                                                       'discount_amount',
+                                                       'sales_amount', 
+                                                       'paid_amount',
+                                                       'item_qty', 
+                                                       'earn_cash_dollar',
+                                                       'earn_bonus_point',
+                                                       'pickup_location',
+                                                       'payment_status', 
+                                                       'payment_status_detail',
+                                                       'payment_code', 
+                                                       'payment_name',
+                                                       'pay_method')
+
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+ods_food_order_detail_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_detail/')
+ods_food_order_header_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_header/')
+ods_food_order_payment_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_payment/')
+ods_food_order_company_profile_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_company_profile/')
+ods_food_order_gift_redemption_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_gift_redemption/')
+ods_food_order_gift_redemption_coupon_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_gift_redemption_coupon/')
+ods_food_order_product_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_product/')
+ods_food_order_product_category_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_product_category/')
+ods_food_order_product_feature_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_product_feature/')
+ods_food_order_product_option_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_product_option/')
+ods_food_order_product_option_d_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_ods_food_order_product_option_d/')
+
+dw_food_order_header.write.format('parquet').mode('overwrite').option("header",True).save(output_path+'tpdt_dw_food_order_header/')
+print(f"Results Saved...")
+
+
+job.commit()
+
+"""
+   ods_food_order_detail_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_detail', transformation_ctx = "ods_food_order_detail").toDF()
+    ods_food_order_header_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_header', transformation_ctx = "ods_food_order_header").toDF()\
+                                                                                                                                                                                           .filter(col('invoice_no')\
+                                                                                                                                                                                           .like('%S%'))\
+                                                                                                                                                                                           .filter(col('invoice_no')\
+                                                                                                                                                                                           .like('%M%'))
+    ods_food_order_payment_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_payment', transformation_ctx = "ods_food_order_payment").toDF()
+    ods_food_order_company_profile_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_company_profile', transformation_ctx = "ods_food_order_company_profile").toDF()
+    ods_food_order_gift_redemption_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_gift_redemption', transformation_ctx = "ods_food_order_gift_redemption").toDF()
+    ods_food_order_gift_redemption_coupon_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_gift_redemption_coupon', transformation_ctx = "ods_food_order_gift_redemption_coupon").toDF()
+    ods_food_order_product_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_product', transformation_ctx = "ods_food_order_product").toDF()
+    ods_food_order_product_category_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_product_category', transformation_ctx = "ods_food_order_product_category").toDF()
+    ods_food_order_product_feature_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_product_feature', transformation_ctx = "ods_food_order_product_feature").toDF()
+    ods_food_order_product_option_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_product_option', transformation_ctx = "ods_food_order_product_option").toDF()
+    ods_food_order_product_option_d_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_food_order_product_option_d', transformation_ctx = "ods_food_order_product_option_d").toDF()
+"""
+

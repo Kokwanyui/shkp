@@ -1,0 +1,102 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import col,from_json, regexp_replace, json_tuple, expr, explode
+import pandas as pd
+import numpy as np
+import json
+
+
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+db01="tpdt_01replica_"+env
+prefix="shkpmalls_stamp_"
+output_path="s3://tpdt-staging-"+env+"/"+table_name
+
+#spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : stamp_card
+t_stamp_card  = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'stamp_card', transformation_ctx = "stamp_card")
+stamp_card_df = t_stamp_card.toDF()
+print("Source Extraxtion Finished: stamp_card...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+stemp_detail_df = stamp_card_df.select('ID',
+                                       col('ID').alias('ID_INDEX'),
+                                       'title_en',
+                                       'title_tc',
+                                       'banner_desc_en',
+                                       'banner_desc_tc',
+                                       col('max_no_of_stamp').alias('max_stamp_per_day'),
+                                       col('max_no_of_receipt').alias('max_receipt_per_day'),
+                                       'max_stamp_per_mall',
+                                       'earn_stamp_rule1',
+                                       col('max_earn_stamp').alias('max_stamp_per_program'),
+                                       'createtime',
+                                       'status',
+                                       'stamp_desc_en',
+                                       'stamp_desc_tc',
+                                       to_date(col('datefrom_collect').cast(StringType()), 'yyyyMMdd').alias('datefrom_collect'),
+                                       to_date(col('dateto_collect').cast(StringType()), 'yyyyMMdd').alias('dateto_collect'),
+                                       to_date(col('datefrom_gift').cast(StringType()), 'yyyyMMdd').alias('datefrom_gift'),
+                                       to_date(col('dateto_gift').cast(StringType()), 'yyyyMMdd').alias('dateto_gift'))
+
+stemp_patch = stamp_card_df.select('ID' , 'earn_stamp_rule1_str').toPandas()
+
+full_stemp_list = []
+for index, row in stemp_patch.iterrows():
+    stemp_list = [row['ID']]
+    # print(row['earn_stamp_rule1_str'])
+    if '|' in row['earn_stamp_rule1_str']:
+        new_list = row['earn_stamp_rule1_str'].split('|')
+        for item_u in new_list:
+            if item_u.split(':')[1] == '1':
+                stemp_list.append(item_u.split(':')[0])
+    else:
+        stemp_list.append(row['earn_stamp_rule1_str'].split(':')[0])
+    full_stemp_list.append(stemp_list)
+
+list_title = ['ID_INDEX_mapping', 'min_spend_for_a_stamp']
+df_stamp_request = pd.DataFrame(np.array(full_stemp_list), columns=list_title)
+stamp_request_sdf = spark.createDataFrame(df_stamp_request)
+
+
+
+ods_stamp_detail = stemp_detail_df.join(stamp_request_sdf, stamp_request_sdf.ID_INDEX_mapping== stemp_detail_df.ID_INDEX, how = "left").withColumnRenamed('ID','stamp_program_id')
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+ods_stamp_detail.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+print(f"Result Saved in {output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+

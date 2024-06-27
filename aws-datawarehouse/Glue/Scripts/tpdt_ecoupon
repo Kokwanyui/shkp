@@ -1,0 +1,697 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from dateutil.relativedelta import relativedelta
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    db03campaign="tpdt_03campaign"
+    output_path="s3://tpdt-campaign/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    db03campaign="tpdt_03campaign_"+env
+    output_path="s3://tpdt-campaign-testing-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+dimension_prefix = "bi_dimension_"
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Menchanism Table
+t_mechanisms = glueContext.create_dynamic_frame.from_catalog(database = db03campaign, table_name = prefix03+'ecoupon_campagin_mechanism', transformation_ctx = "ecoupon_campagin_mechanism")
+mechanisms_df = t_mechanisms.toDF()
+mechanisms_df.createOrReplaceTempView("mechanisms")
+
+# Conidition Tables
+t_spending_campaign_spending_condition = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_spending_condition', transformation_ctx = "spending_campaign_spending_condition")
+spending_campaign_spending_condition_df = t_spending_campaign_spending_condition.toDF()
+spending_campaign_spending_condition_df.createOrReplaceTempView("spending_campaign_spending_condition")
+
+t_spending_campaign_spending_condition_mall = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_spending_condition_mall', transformation_ctx = "spending_campaign_spending_condition_mall")
+spending_campaign_spending_condition_mall_df = t_spending_campaign_spending_condition_mall.toDF()
+spending_campaign_spending_condition_mall_df.createOrReplaceTempView("spending_campaign_spending_condition_mall")
+
+t_spending_campaign_spending_condition_payment_type = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_spending_condition_payment_type', transformation_ctx = "spending_campaign_spending_condition_payment_type")
+spending_campaign_spending_condition_payment_type_df = t_spending_campaign_spending_condition_payment_type.toDF()
+spending_campaign_spending_condition_payment_type_df.createOrReplaceTempView("spending_campaign_spending_condition_payment_type")
+
+t_spending_campaign_spending_condition_shop = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_spending_condition_shop', transformation_ctx = "spending_campaign_spending_condition_shop")
+spending_campaign_spending_condition_shop_df = t_spending_campaign_spending_condition_shop.toDF()
+spending_campaign_spending_condition_shop_df.createOrReplaceTempView("spending_campaign_spending_condition_shop")
+
+t_spending_campaign_spending_condition_special_date = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_spending_condition_special_date', transformation_ctx = "spending_campaign_spending_condition_special_date")
+spending_campaign_spending_condition_special_date_df = t_spending_campaign_spending_condition_special_date.toDF()
+spending_campaign_spending_condition_special_date_df.createOrReplaceTempView("spending_campaign_spending_condition_special_date")
+
+t_spending_campaign_spending_condition_weekdays = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_spending_condition_weekdays', transformation_ctx = "spending_campaign_spending_condition_weekdays")
+spending_campaign_spending_condition_weekdays_df = t_spending_campaign_spending_condition_weekdays.toDF()
+spending_campaign_spending_condition_weekdays_df.createOrReplaceTempView("spending_campaign_spending_condition_weekdays")
+
+t_master_data = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'master_data', transformation_ctx = "master_data")
+master_data_df = t_master_data.toDF()
+master_data_df.createOrReplaceTempView("master_data")
+
+t_previous = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'ecoupon_previous_logic_campaign', transformation_ctx = "ecoupon_previous_logic_campaign")
+previous_df = t_previous.toDF()
+previous_df.createOrReplaceTempView("previous")
+
+# Reward Tables
+t_spending_campaign_tier_redemption_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_tier_redemption_transaction', transformation_ctx = "spending_campaign_tier_redemption_transaction")
+spending_campaign_tier_redemption_transaction_df = t_spending_campaign_tier_redemption_transaction.toDF()
+spending_campaign_tier_redemption_transaction_df.createOrReplaceTempView("spending_campaign_tier_redemption_transaction")
+
+t_spending_campaign_tier_redemption_transaction_map = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_tier_redemption_transaction_mapping', transformation_ctx = "spending_campaign_tier_redemption_transaction_mapping")
+spending_campaign_tier_redemption_transaction_map_df = t_spending_campaign_tier_redemption_transaction_map.toDF()
+spending_campaign_tier_redemption_transaction_map_df.createOrReplaceTempView("spending_campaign_tier_redemption_transaction_mapping")
+
+# Spending Tables
+t_spending = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "dw_spending")
+spending_df = t_spending.toDF().select('receipt_id',
+                                       translate(regexp_replace(lower(col('invoice_no')), '[^a-z0-9]+', ''), 'r','').alias('invoice_no'),
+                                       'receipt_upload_datetime',
+                                       'receipt_upload_date',
+                                       'receipt_transaction_date',
+                                       'spending_transaction_id',
+                                       'mall_id',
+                                       'property_id',
+                                       'team',
+                                       'member_id',
+                                       'shop_id',
+                                       'lms_standard_brand_name',
+                                       'lms_standard_trade_category',
+                                       'payment_type',
+                                       'receipt_amount',
+                                       'platform',
+                                       'partner')\
+                               .filter("receipt_status_detail = 'Approved'")\
+                               .filter("member_status_detail NOT IN ('Suspended', 'Invalid', 'Waiting for verification', 'Marked For Deletion')")\
+                               .filter("Team not in ('Partner')")\
+                               .filter("abnormal_case = 0")\
+                               .filter(f"receipt_upload_datetime >= date_sub(CAST(current_timestamp() as DATE), 300)")\
+                               .filter(f"receipt_upload_date < CAST(current_timestamp() as DATE)")
+spending_df.createOrReplaceTempView("spending")
+
+# Redemption Tables
+t_coupon_redemption_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'coupon_redemption_transaction', transformation_ctx = "coupon_redemption_transaction")
+coupon_redemption_transaction_df = t_coupon_redemption_transaction.toDF().select('coupon_redemption_transaction_id' ,
+                                                                                 when(col('status')=='R',lit('Redeemed but not yet used Shop Gift / SHKP Mall e-Gift Certificate'))\
+                                                                                 .when(col('status')=='U',lit('Redeemed and used Shop Gift / SHKP Mall e-Gift Certificate'))\
+                                                                                 .when(col('status')=='C', lit('Cancelled Redemption of Mall Gift (CCC) or Shop Gift / SHKP Mall e-Gift Certificate'))\
+                                                                                 .when(col('status')=='E', lit('Redeemed but forfeited Shop Gift / SHKP Mall e-Gift Certificate'))\
+                                                                                 .when(col('status')=='W', lit('Point + Cash Waiting for Payment'))\
+                                                                                 .when(col('status')=='L', lit('Point + Cash Auto Cancellation'))\
+                                                                                 .alias('redemption_status_detail'),
+                                                                                 col('item_name_lang1').alias('coupon_name'),
+                                                                                 col('mall_id').alias('coupon_redeemed_mall_id'),
+                                                                                 col('redeem_datetime').alias('coupon_redeem_datetime'),
+                                                                                 col('redeem_type').alias('coupon_redeem_type'),
+                                                                                 col('used_datetime').alias('coupon_used_datetime'),
+                                                                                 col('used_mall_id').alias('coupon_used_in_mall_id'),
+                                                                                 col('used_shop_id').alias('coupon_used_in_shop_id'),
+                                                                                 col('value_amount').alias('coupon_value_amount'),
+                                                                                 col('member_id').alias('redeem_coupon_member_id'),
+                                                                                 'coupon_id',
+                                                                                 'linked_sales_amount',
+                                                                                 'min_spending_amount')\
+                                                                         .filter("to_date(created_date) >= date_sub(CAST(current_timestamp() as DATE), 300)")\
+                                                                         .withColumn('coupon_redeem_date', to_date(col('coupon_redeem_datetime')- expr("INTERVAL 8 hours")))\
+                                                                         .withColumn('coupon_used_date', to_date(col('coupon_used_datetime')- expr("INTERVAL 8 hours")))
+coupon_redemption_transaction_df.createOrReplaceTempView("coupon_redemption_transaction")
+
+# Mall Mapping table
+if env == 'prod':
+    t_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_mall_mapping', transformation_ctx = "dim_mall_mapping")
+    mall_mapping_df = t_mall_mapping.toDF()
+else:
+    mall_mapping_df = spark.read.csv(dimension_path + 'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv', header='true', inferSchema='true', sep=',')
+mall_mapping_df.createOrReplaceTempView("mall_mapping")
+print("Source Extraxtion Finished: dim_tp_mall_mapping.csv...")
+
+# Shop Mapping table
+t_staging_shop = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_shop', transformation_ctx = "staging_shop")
+staging_shop_df = t_staging_shop.toDF()
+staging_shop_df.createOrReplaceTempView("staging_shop")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Transformation 1: Prepare Ecoupon Campaign Condition Conbinationa
+conditions_df = spark.sql("""
+SELECT
+    t1.condition_id,
+    t1.spending_campaign_id,
+    t1.start_date as campaign_start_date,
+    t1.end_date as campaign_end_date,
+    t1.public_holiday,
+    t1.non_public_holiday,
+    t1.min_receipt_amount,
+    t1.max_no_of_receipt_set,
+    t2.mall_id,
+    t3.master_data_id,
+    t7.name_lang1 as payment_method,
+    t4.shop_id,
+    t5.special_date,
+    t6.weekdays
+FROM spending_campaign_spending_condition t1
+left join spending_campaign_spending_condition_mall t2 on t1.condition_id = t2.condition_id
+left join spending_campaign_spending_condition_payment_type t3 on t1.condition_id = t3.condition_id
+left join spending_campaign_spending_condition_shop t4 on t1.condition_id = t4.condition_id
+left join spending_campaign_spending_condition_special_date t5 on t1.condition_id = t5.condition_id
+left join spending_campaign_spending_condition_weekdays  t6 on t1.condition_id = t6.condition_id
+left join master_data t7 on t7.master_data_id = t3.master_data_id
+""")
+conditions_df.createOrReplaceTempView("conditions")
+
+
+# Transformation 2: Identify Selected Campaigns
+selected_campaign_df = mechanisms_df.filter("display_in_transaction = 1").distinct()
+selected_campaign_df.createOrReplaceTempView("selected_campaign")
+
+
+# Transformation 3: Identify Conversion
+conversion_df = spark.sql("""
+Select Distinct
+       t1.id,
+       t1.member_id,
+       t1.spending_campaign_id,
+       t1.redemption_date as redemption_datetime,
+       to_date(t1.redemption_date - INTERVAL 8 HOURS) as redemption_date,
+       t1.mall_id,
+       t1.tier_id,
+       t1.created_date as created_datetime,
+       t1.created_date - interval 19 seconds as invoice_submit_start,
+       to_date(t1.created_date - INTERVAL 8 HOURS) as created_date,
+       t2.campaign_condition_id,
+       t2.campaign_start_date,
+       t2.campaign_end_date,
+       t2.campaign_name
+from spending_campaign_tier_redemption_transaction t1
+inner join selected_campaign t2 on t1.spending_campaign_id = t2.spending_campaign_id and t1.tier_id = t2.tier_id
+""")
+conversion_df.createOrReplaceTempView("conversion")
+
+
+# Transformation 4: Identify First Direct Spend
+potential_first_direct = spark.sql("""
+Select Distinct
+       t1.receipt_id,
+       t1.member_id,
+       t1.mall_id                  as spending_mall_id,
+       t1.receipt_transaction_date as spending_transaction_date,
+       t1.shop_id                  as spending_shop_id,
+       t1.payment_type             as spending_payment_type,
+       t1.receipt_amount,
+       t2.spending_campaign_id,
+       t2.tier_id,
+       t2.redemption_date,
+       t2.mall_id                  as redemption_mall_id,
+       t2.campaign_condition_id
+from spending t1
+inner join conversion t2 on t1.member_id = t2.member_id and t1.receipt_upload_date = t2.created_date 
+where t1.receipt_upload_datetime between t2.invoice_submit_start and t2.created_datetime + INTERVAL 10 SECONDS
+and platform = 'counter'
+""")
+potential_first_direct.createOrReplaceTempView("potential_first_direct")
+
+first_direct_to_match_conditions = spark.sql("""
+Select Distinct
+       t1.*,
+       case when t2.mall_id is null                             then 1
+            when t2.mall_id = t1.spending_mall_id               then 1
+            else 0 end                                          as meeting_mall_condition,
+
+       case when t2.payment_method is null                      then 1
+            when t2.payment_method = t1.spending_payment_type   then 1
+            else 0 end                                          as meeting_payment_method_condition,
+
+       case when t2.shop_id is null                             then 1
+            when t2.shop_id = t1.spending_shop_id               then 1
+            else 0 end                                          as meeting_shop_condition,
+
+       case when t2.min_receipt_amount is null                  then 1
+            when t1.receipt_amount >= t2.min_receipt_amount     then 1
+            else 0 end                                          as meeting_min_receipt_amount
+from potential_first_direct t1
+inner join conditions t2 on t1.campaign_condition_id = t2.condition_id
+""")
+
+first_direct = first_direct_to_match_conditions.filter("meeting_mall_condition = 1 and meeting_payment_method_condition = 1 and meeting_shop_condition = 1 and meeting_min_receipt_amount = 1")\
+                                               .drop('meeting_mall_condition', 'meeting_payment_method_condition', 'meeting_shop_condition', 'meeting_min_receipt_amount')
+first_direct.createOrReplaceTempView("first_direct")
+
+first_direct.write.format('parquet').mode('overwrite').option("header",True).save('s3://tpdt-campaign/first_direct/')
+
+first_spend_key = first_direct.select('member_id', 'spending_mall_id', 'spending_transaction_date', 'spending_campaign_id', 'tier_id', 'redemption_date', 'redemption_mall_id').distinct()
+first_spend_key.createOrReplaceTempView("first_spend_key")
+
+all_first_spend = spark.sql("""
+Select  t1.*, t2.spending_campaign_id, t2.tier_id, t2.redemption_date, t2.redemption_mall_id
+From spending t1
+inner join first_spend_key t2 on t1.member_id = t2.member_id and t1.mall_id = t2.spending_mall_id and t1.receipt_transaction_date = t2.spending_transaction_date
+""")
+all_first_spend.createOrReplaceTempView("all_first_spend")
+
+
+# Transformation 5: Identify Second Spend
+coupon_redeemed_1 = spark.sql("""
+Select  Distinct t1.*,
+        t2.spending_campaign_id,
+        t2.tier_id,
+        t2.campaign_tier,
+        t2.campaign_start_date,
+        t2.campaign_end_date,
+        t2.campaign_name,
+        t3.property_id as coupon_redeemed_property_id,
+        t4.property_id as coupon_used_in_property_id,
+        t3.team        as coupon_redeemed_team,
+        t4.team        as coupon_used_in_team,
+        case when t1.min_spending_amount - t1.coupon_value_amount <= 0 then 0
+             else t1.min_spending_amount - t1.coupon_value_amount end as min_top_up_amount
+from coupon_redemption_transaction t1
+inner join selected_campaign t2 on t1.coupon_id = t2.reward_id
+left join mall_mapping t3 on t3.mall_id = t1.coupon_redeemed_mall_id
+left join mall_mapping t4 on t4.mall_id = t1.coupon_used_in_mall_id
+inner join conversion t5 on t1.redeem_coupon_member_id = t5.member_id 
+and t2.spending_campaign_id = t5.spending_campaign_id 
+and t2.tier_id = t5.tier_id 
+and t1.coupon_redeem_datetime between t5.redemption_datetime - INTERVAL 2 SECONDS and t5.redemption_datetime + INTERVAL 2 SECONDS
+and t1.coupon_redeemed_mall_id = t5.mall_id
+where to_date(t1.coupon_redeem_datetime - INTERVAL 8 HOURS) < to_date('2022-09-20','yyyy-MM-dd')
+""")
+
+coupon_redeemed_2 = spark.sql("""
+Select  Distinct t1.*,
+        t2.spending_campaign_id,
+        t2.tier_id,
+        t2.campaign_tier,
+        t2.campaign_start_date,
+        t2.campaign_end_date,
+        t2.campaign_name,
+        t3.property_id as coupon_redeemed_property_id,
+        t4.property_id as coupon_used_in_property_id,
+        t3.team        as coupon_redeemed_team,
+        t4.team        as coupon_used_in_team,
+        case when t1.min_spending_amount - t1.coupon_value_amount <= 0 then 0
+             else t1.min_spending_amount - t1.coupon_value_amount end as min_top_up_amount
+from coupon_redemption_transaction t1
+inner join spending_campaign_tier_redemption_transaction_mapping t5 on t1.coupon_redemption_transaction_id = t5.redemption_transaction_id
+inner join conversion t6 on t5.id = t6.id
+left join mall_mapping t3 on t3.mall_id = t1.coupon_redeemed_mall_id
+left join mall_mapping t4 on t4.mall_id = t1.coupon_used_in_mall_id
+inner join selected_campaign t2 on t6.tier_id = t2.tier_id
+where to_date(t1.coupon_redeem_datetime - INTERVAL 8 HOURS) >= to_date('2022-09-20','yyyy-MM-dd')
+""")
+
+coupon_redeemed = coupon_redeemed_1.union(coupon_redeemed_2).distinct()
+
+coupon_used_on_same_date = coupon_redeemed.select('redeem_coupon_member_id',
+                                                  'coupon_used_in_shop_id',
+                                                  'coupon_used_date',
+                                                  'coupon_redeemed_mall_id',
+                                                  'coupon_redeem_date',
+                                                  'spending_campaign_id',
+                                                  'tier_id',
+                                                  'campaign_tier')\
+                                          .filter("coupon_used_date = coupon_redeem_date")\
+                                          .distinct()
+coupon_used_on_same_date.createOrReplaceTempView("coupon_used_on_same_date")
+
+coupon_used_on_diff_date = coupon_redeemed.select('redeem_coupon_member_id',
+                                                  'coupon_used_in_mall_id',
+                                                  'coupon_used_date',
+                                                  'coupon_redeemed_mall_id',
+                                                  'coupon_redeem_date',
+                                                  'spending_campaign_id',
+                                                  'tier_id',
+                                                  'campaign_tier')\
+                                          .filter("coupon_used_date != coupon_redeem_date")\
+                                          .filter("coupon_used_date is not null")\
+                                          .distinct()
+coupon_used_on_diff_date.createOrReplaceTempView("coupon_used_on_diff_date")
+
+second_direct_spend_key = coupon_redeemed.select('redeem_coupon_member_id',
+                                                  'coupon_used_in_shop_id',
+                                                  'coupon_used_date',
+                                                  'coupon_redeemed_mall_id',
+                                                  'coupon_redeem_date',
+                                                  'spending_campaign_id',
+                                                  'tier_id',
+                                                  'campaign_tier')\
+                                          .filter("coupon_used_date != coupon_redeem_date")\
+                                          .filter("coupon_used_date is not null")\
+                                          .distinct()
+second_direct_spend_key.createOrReplaceTempView("second_direct_spend_key")
+
+second_spend_on_diff_date = spark.sql("""
+Select t1.*, t2.spending_campaign_id, t2.tier_id, t2.coupon_redeem_date, t2.coupon_redeemed_mall_id,
+     case when t3.redeem_coupon_member_id is not null then 'Second Direct Spend'
+     else 'Second Indirect Spend' end as linked_spend_type
+from spending t1
+inner join coupon_used_on_diff_date t2 on t1.member_id = t2.redeem_coupon_member_id and t1.mall_id = t2.coupon_used_in_mall_id and t1.receipt_transaction_date = t2.coupon_used_date
+left join second_direct_spend_key t3 on t1.member_id = t3.redeem_coupon_member_id and t1.shop_id = t3.coupon_used_in_shop_id and t1.receipt_transaction_date = t3.coupon_used_date and t2.spending_campaign_id = t3.spending_campaign_id
+and t2.tier_id = t3.tier_id
+""")
+
+
+# Transformation 6: Identify All Linked Spend
+first_and_samedate_second_spend = spark.sql("""
+Select  t1.*,
+        case when t2.receipt_id is not null then 'First Direct Spend'
+        when t3.redeem_coupon_member_id is not null and t1.receipt_upload_date = t1.receipt_transaction_date then 'Second Direct Spend'
+        else 'First Indirect Spend' end as linked_spend_type
+From all_first_spend t1
+left join first_direct t2 on t1.receipt_id = t2.receipt_id
+                             and t1.spending_campaign_id = t2.spending_campaign_id
+                             and t1.tier_id = t2.tier_id
+                             and t1.redemption_date = t2.redemption_date
+                             and t1.redemption_mall_id = t2.redemption_mall_id
+left join coupon_used_on_same_date t3 on t1.spending_campaign_id = t3.spending_campaign_id
+                                         and t1.tier_id = t3.tier_id
+                                         and t1.redemption_date = t3.coupon_redeem_date
+                                         and t1.redemption_mall_id = t3.coupon_redeemed_mall_id
+                                         and t1.member_id = t3.redeem_coupon_member_id
+                                         and t1.shop_id = t3.coupon_used_in_shop_id
+""")
+
+all_linked_spend_raw = first_and_samedate_second_spend.union(second_spend_on_diff_date).distinct()
+all_linked_spend_raw.createOrReplaceTempView("all_linked_spend_raw")
+
+
+# Transacformation 7: cleaning repeated receipt
+''' Excluded
+cleaning_repeated_receipt = all_linked_spend_raw.groupBy('member_id','invoice_no').agg(min(col('receipt_id')).alias('receipt_id_to_remain'))
+cleaning_repeated_receipt.createOrReplaceTempView("cleaning_repeated_receipt")
+
+all_linked_spend = spark.sql("""
+Select t1.*
+from all_linked_spend_raw t1
+inner join cleaning_repeated_receipt t2 
+on t1.member_id = t2.member_id 
+and	t1.invoice_no = t2.invoice_no
+and t1.receipt_id = t2.receipt_id_to_remain
+""")
+'''
+# Transacformation 7.1: cleaning repeated receipt in First Indirect Spend
+cleaning_repeated_receipt_part1 = all_linked_spend_raw.filter("linked_spend_type = 'First Direct Spend'")\
+                                                      .select('spending_campaign_id', 'tier_id', 'redemption_date', 'redemption_mall_id','member_id','invoice_no','shop_id')\
+                                                      .withColumn('linked_spend_type', lit('First Indirect Spend'))\
+                                                      .distinct()
+cleaning_repeated_receipt_part1.createOrReplaceTempView("cleaning_repeated_receipt_part1")
+
+
+all_linked_spend_raw2 = spark.sql("""
+Select Distinct t1.*
+from all_linked_spend_raw t1
+left join cleaning_repeated_receipt_part1 t2 on t1.spending_campaign_id = t2.spending_campaign_id
+and t1.tier_id = t2.tier_id
+and t1.redemption_date = t2.redemption_date
+and t1.redemption_mall_id = t2.redemption_mall_id
+and t1.member_id = t2.member_id
+and t1.invoice_no = t2.invoice_no
+and t1.shop_id = t2.shop_id
+and t1.linked_spend_type = t2.linked_spend_type
+where t2.member_id is null
+""")
+all_linked_spend_raw2.createOrReplaceTempView("all_linked_spend_raw2")
+
+# Transacformation 7.2: cleaning repeated receipt in same linked_spend_type
+cleaning_repeated_receipt_part2 = all_linked_spend_raw2.groupBy('spending_campaign_id', 'tier_id', 'redemption_date', 'redemption_mall_id','member_id','invoice_no','shop_id','linked_spend_type').agg(min(col('receipt_id')).alias('receipt_id_to_remain'))
+cleaning_repeated_receipt_part2.createOrReplaceTempView("cleaning_repeated_receipt_part2")
+
+all_linked_spend_raw3 = spark.sql("""
+Select t1.*
+from all_linked_spend_raw2 t1
+inner join cleaning_repeated_receipt_part2 t2 
+on t1.spending_campaign_id = t2.spending_campaign_id
+and t1.tier_id = t2.tier_id
+and t1.redemption_date = t2.redemption_date
+and t1.redemption_mall_id = t2.redemption_mall_id
+and t1.member_id = t2.member_id
+and t1.invoice_no = t2.invoice_no
+and t1.shop_id = t2.shop_id
+and t1.linked_spend_type = t2.linked_spend_type
+and t1.receipt_id = t2.receipt_id_to_remain
+""")
+all_linked_spend_raw3.createOrReplaceTempView("all_linked_spend_raw3")
+
+
+# Transacformation 8: Adjust same receipt within campaign
+first_direct = all_linked_spend_raw.select('spending_campaign_id', 'member_id', 'invoice_no').filter("linked_spend_type = 'First Direct Spend'").distinct()
+first_direct.createOrReplaceTempView("first_direct")
+
+second_direct = all_linked_spend_raw.select('spending_campaign_id', 'member_id', 'invoice_no').filter("linked_spend_type = 'Second Direct Spend'").distinct()
+second_direct.createOrReplaceTempView("second_direct")
+
+first_indirect = all_linked_spend_raw.select('spending_campaign_id', 'member_id', 'invoice_no').filter("linked_spend_type = 'First Indirect Spend'").distinct()
+first_indirect.createOrReplaceTempView("first_indirect")
+
+
+all_linked_spend = spark.sql("""
+Select  t1.*,
+        case when t2.invoice_no is not null and linked_spend_type in ('Second Direct Spend', 'First Indirect Spend', 'Second Indirect Spend') then 'same receipt already exists within campaign'
+        when t3.invoice_no is not null and linked_spend_type in ('First Indirect Spend', 'Second Indirect Spend') then 'same receipt already exists within campaign'
+        when t4.invoice_no is not null and linked_spend_type in ('Second Indirect Spend') then 'same receipt already exists within campaign'
+        else 'valid receipt to count spending' end as spending_filter
+from all_linked_spend_raw3 t1
+left join first_direct t2 on t1.spending_campaign_id = t2.spending_campaign_id and t1.invoice_no = t2.invoice_no and t1.member_id = t2.member_id
+left join second_direct t3 on t1.spending_campaign_id = t3.spending_campaign_id and t1.invoice_no = t3.invoice_no and t1.member_id = t3.member_id
+left join first_indirect t4 on t1.spending_campaign_id = t4.spending_campaign_id and t1.invoice_no = t4.invoice_no and t1.member_id = t4.member_id
+""")
+
+
+# Transacformation 9: Adjust for Second Direct Linked Spned
+second_direct_agg = all_linked_spend.select('member_id', 'receipt_transaction_date', 'shop_id', 'tier_id')\
+                                     .filter("linked_spend_type = 'Second Direct Spend'")\
+                                     .filter("spending_filter = 'valid receipt to count spending'")\
+                                     .distinct()
+second_direct_agg.createOrReplaceTempView("second_direct_agg")
+
+second_direct_from_redemption = coupon_redeemed.groupBy('coupon_used_in_mall_id', 'redemption_status_detail', 'coupon_used_in_property_id', 'coupon_used_in_team', 'redeem_coupon_member_id', 'coupon_used_in_shop_id', 'coupon_used_date','spending_campaign_id', 'tier_id', 'campaign_tier','coupon_redeem_date', 'coupon_redeemed_mall_id').agg(sum('min_top_up_amount').alias('min_top_up_amount'))
+second_direct_from_redemption.createOrReplaceTempView("second_direct_from_redemption")
+
+second_spend_without_invoice = spark.sql("""
+Select  'No_Invoice_Upload' as receipt_id,
+        'No_Invoice_Upload' as invoice_no,
+        NULL as receipt_upload_datetime,
+        NULL as receipt_upload_date,
+        t1.coupon_used_date as receipt_transaction_date,
+        NULL as spending_transaction_id,
+        t1.coupon_used_in_mall_id as mall_id,
+        t1.coupon_used_in_property_id as property_id,
+        t1.coupon_used_in_team as team,
+        t1.redeem_coupon_member_id,
+        t1.coupon_used_in_shop_id,
+        t3.lms_standard_brand_name,
+        t3.lms_standard_trade_category,
+        NULL as payment_type,
+        ifnull(min_top_up_amount,0) as receipt_amount,
+        NULL as platform,
+        NULL as partner,
+        t1.spending_campaign_id,
+        t1.tier_id,
+        coupon_redeem_date as redemption_date,
+        coupon_redeemed_mall_id as redemption_mall_id,
+        'Second Direct Spend without Invoice' as linked_spend_type,
+        'No_Invoice_Upload' as spending_filter
+From second_direct_from_redemption t1
+left join second_direct_agg t2 on t1.redeem_coupon_member_id = t2.member_id and t1.coupon_used_date = t2.receipt_transaction_date and t1.coupon_used_in_shop_id = t2.shop_id and t1.tier_id = t2.tier_id
+left join staging_shop t3 on t1.coupon_used_in_shop_id = t3.mapping_shop_id
+where t2.member_id is null and t1.redemption_status_detail = 'Redeemed and used Shop Gift / SHKP Mall e-Gift Certificate'
+""")
+
+transaction_staging_df = all_linked_spend.union(second_spend_without_invoice).distinct()
+transaction_staging_df.createOrReplaceTempView("transaction_staging")
+
+
+transaction_df = spark.sql("""
+Select distinct t1.*, t2.campaign_tier, t2.campaign_name, t2.campaign_start_date, t2.campaign_end_date, t3.property_id as redemption_property_id
+from transaction_staging t1
+left join (select distinct tier_id, campaign_tier, campaign_name, campaign_start_date,campaign_end_date from mechanisms) t2 on t1.tier_id = t2.tier_id
+left join mall_mapping t3 on t3.mall_id = t1.redemption_mall_id
+""")
+
+#transaction_final_df = transaction_df.withColumn("id", monotonically_increasing_id() + lit(1))
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Saving Campaign Condition
+condition_detail_output_path = f'{output_path}tpdt_ecoupon_campaign_condition/'
+conditions_df.write.format('parquet').mode('overwrite').option("header",True).save(condition_detail_output_path)
+
+
+# Saving campaign_transactions
+all_linked_spend_output_path = f'{output_path}tpdt_ecoupon_campaign_transaction/'
+transaction_df.write.format('parquet').mode('overwrite').option("header",True).save(all_linked_spend_output_path)
+
+# Saving campaign_redemptions
+coupon_redeemed_output_path = f'{output_path}tpdt_ecoupon_campaign_redemption/'
+coupon_redeemed.write.format('parquet').mode('overwrite').option("header",True).save(coupon_redeemed_output_path)
+
+'''
+
+
+
+
+# new 9 
+
+second_direct_agg = all_linked_spend.select('member_id', 'receipt_transaction_date', 'shop_id').distinct()
+second_direct_agg.createOrReplaceTempView("second_direct_agg")
+
+
+second_direct_agg2 = all_linked_spend.select('member_id', 'receipt_transaction_date', 'shop_id', 'tier_id')\
+                                     .filter("linked_spend_type = 'Second Direct Spend'")\
+                                     .filter("spending_filter = 'valid receipt to count spending'")\
+                                     .distinct()
+second_direct_agg2.createOrReplaceTempView("second_direct_agg")
+
+second_direct_from_redemption = coupon_redeemed.groupBy('coupon_used_in_mall_id', 'redemption_status_detail', 'coupon_used_in_property_id', 'coupon_used_in_team', 'redeem_coupon_member_id', 'coupon_used_in_shop_id', 'coupon_used_date','spending_campaign_id', 'tier_id', 'campaign_tier','coupon_redeem_date', 'coupon_redeemed_mall_id').agg(sum('min_top_up_amount').alias('min_top_up_amount'))
+second_direct_from_redemption.createOrReplaceTempView("second_direct_from_redemption")
+
+second_spend_without_invoice = spark.sql("""
+Select  'No_Invoice_Upload' as receipt_id,
+        'No_Invoice_Upload' as invoice_no,
+        NULL as receipt_upload_datetime,
+        NULL as receipt_upload_date,
+        t1.coupon_used_date as receipt_transaction_date,
+        NULL as spending_transaction_id,
+        t1.coupon_used_in_mall_id as mall_id,
+        t1.coupon_used_in_property_id as property_id,
+        t1.coupon_used_in_team as team,
+        t1.redeem_coupon_member_id,
+        t1.coupon_used_in_shop_id,
+        t3.lms_standard_brand_name,
+        t3.lms_standard_trade_category,
+        NULL as payment_type,
+        ifnull(min_top_up_amount,0) as receipt_amount,
+        NULL as platform,
+        NULL as partner,
+        t1.spending_campaign_id,
+        t1.tier_id,
+        coupon_redeem_date as redemption_date,
+        coupon_redeemed_mall_id as redemption_mall_id,
+        'Second Direct Spend without Invoice' as linked_spend_type,
+        'No_Invoice_Upload' as spending_filter
+From second_direct_from_redemption t1
+left join second_direct_agg t2 on t1.redeem_coupon_member_id = t2.member_id and t1.coupon_used_date = t2.receipt_transaction_date and t1.coupon_used_in_shop_id = t2.shop_id
+left join staging_shop t3 on t1.coupon_used_in_shop_id = t3.mapping_shop_id
+inner join previous t4 on t1.tier_id = t4.tier_id
+where t2.member_id is null and t1.redemption_status_detail = 'Redeemed and used Shop Gift / SHKP Mall e-Gift Certificate'
+""")
+
+second_spend_without_invoice2 = spark.sql("""
+Select  'No_Invoice_Upload' as receipt_id,
+        'No_Invoice_Upload' as invoice_no,
+        NULL as receipt_upload_datetime,
+        NULL as receipt_upload_date,
+        t1.coupon_used_date as receipt_transaction_date,
+        NULL as spending_transaction_id,
+        t1.coupon_used_in_mall_id as mall_id,
+        t1.coupon_used_in_property_id as property_id,
+        t1.coupon_used_in_team as team,
+        t1.redeem_coupon_member_id,
+        t1.coupon_used_in_shop_id,
+        t3.lms_standard_brand_name,
+        t3.lms_standard_trade_category,
+        NULL as payment_type,
+        ifnull(min_top_up_amount,0) as receipt_amount,
+        NULL as platform,
+        NULL as partner,
+        t1.spending_campaign_id,
+        t1.tier_id,
+        coupon_redeem_date as redemption_date,
+        coupon_redeemed_mall_id as redemption_mall_id,
+        'Second Direct Spend without Invoice' as linked_spend_type,
+        'No_Invoice_Upload' as spending_filter
+From second_direct_from_redemption t1
+left join second_direct_agg t2 on t1.redeem_coupon_member_id = t2.member_id and t1.coupon_used_date = t2.receipt_transaction_date and t1.coupon_used_in_shop_id = t2.shop_id and t1.tier_id = t2.tier_id
+left join staging_shop t3 on t1.coupon_used_in_shop_id = t3.mapping_shop_id
+left join previous t4 on t1.tier_id = t4.tier_id
+where t2.member_id is null and t1.redemption_status_detail = 'Redeemed and used Shop Gift / SHKP Mall e-Gift Certificate' and t4.tier_id is null
+""")
+
+
+
+
+transaction_staging_df = all_linked_spend.union(second_spend_without_invoice).distinct()
+transaction_staging_df.createOrReplaceTempView("transaction_staging")
+
+transaction_staging_df = all_linked_spend.union(second_spend_without_invoice).distinct()
+transaction_staging_df2 = transaction_staging_df.union(second_spend_without_invoice2).distinct()
+transaction_staging_df2.createOrReplaceTempView("transaction_staging")
+
+
+second_spend_without_invoice = spark.sql("""
+Select  'No_Invoice_Upload' as receipt_id,
+        'No_Invoice_Upload' as invoice_no,
+        NULL as receipt_upload_datetime,
+        NULL as receipt_upload_date,
+        t1.coupon_used_date as receipt_transaction_date,
+        NULL as spending_transaction_id,
+        t1.coupon_used_in_mall_id as mall_id,
+        t1.coupon_used_in_property_id as property_id,
+        t1.coupon_used_in_team as team,
+        t1.redeem_coupon_member_id,
+        t1.coupon_used_in_shop_id,
+        t3.lms_standard_brand_name,
+        t3.lms_standard_trade_category,
+        NULL as payment_type,
+        ifnull(min_top_up_amount,0) as receipt_amount,
+        NULL as platform,
+        NULL as partner,
+        t1.spending_campaign_id,
+        t1.tier_id,
+        coupon_redeem_date as redemption_date,
+        coupon_redeemed_mall_id as redemption_mall_id,
+        'Second Direct Spend without Invoice' as linked_spend_type,
+        'No_Invoice_Upload' as spending_filter
+From second_direct_from_redemption t1
+left join second_direct_agg t2 on t1.redeem_coupon_member_id = t2.member_id and t1.coupon_used_date = t2.receipt_transaction_date and t1.coupon_used_in_shop_id = t2.shop_id and t1.tier_id = t2.tier_id
+left join staging_shop t3 on t1.coupon_used_in_shop_id = t3.mapping_shop_id
+left join previous t4 on t1.tier_id = t4.tier_id
+where t2.member_id is null and t1.redemption_status_detail = 'Redeemed and used Shop Gift / SHKP Mall e-Gift Certificate' and t4.tier_id is null
+""")
+'''
+
+

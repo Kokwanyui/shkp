@@ -1,0 +1,350 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-adobe-test/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    district_mapping_s3_location = 's3://tpdt-dimension/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-adobe-test-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    district_mapping_s3_location = 's3://tpdt-dimension-'+env+'/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+bi_prefix = 'bi_datamart_'
+dimension_prefix = 'bi_dimension_'
+suffix = datetime.now().astimezone(timezone(timedelta(hours=8))).strftime("%Y%m%d%H%M%S")
+
+
+## udfs
+def save_df(df, separator, root_folder):
+    # clean all objects in folder
+    s3 = boto3.resource('s3')
+    clean_bucket = s3.Bucket('tpdt-adobe-test')
+    clean_prefix = f'{root_folder}/input/'
+    clean_bucket.objects.filter(Prefix=clean_prefix).delete()
+    
+    # save temp file
+    output_path = f"s3://tpdt-adobe-test/{root_folder}/input/temp"
+    df.coalesce(1).write.mode("overwrite").option("timestampFormat", "yyyy-MM-dd HH:mm:ss").option("dateFormat", "yyyy-MM-dd").option("compression", "gzip").csv(output_path, header="true", sep=separator)
+
+
+def renaming_output(root_folder, cdp_tablename):
+    # renaming config
+    s3 = boto3.client('s3')
+    BucketName = 'tpdt-adobe-test'
+    FolderName = f'{root_folder}/input/temp/'
+    FinalFolder = f'{root_folder}/input/'
+    
+    NewFile = f'{FinalFolder}{cdp_tablename}_{suffix}.csv.gz'
+    response = s3.list_objects(
+        Bucket= BucketName,
+        MaxKeys = 2,
+        Prefix=FolderName
+        )
+    OldFile=response['Contents'][0]['Key']
+    OldSource=BucketName + '/' +   OldFile
+    
+    # move file and rename
+    rename_file = boto3.resource('s3')
+    rename_file.Object(BucketName,NewFile).copy_from(CopySource=OldSource)
+    rename_file.Object(BucketName,OldFile).delete()
+    
+
+## Tables  -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : cleaned_dw_member------------------
+t_member_raw = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_member', transformation_ctx = "member_raw")
+member_raw_df = t_member_raw.toDF().filter("registration_date < current_date()")
+member_raw_df.createOrReplaceTempView("member_raw_df")
+
+t_migrated_member = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = bi_prefix+'ods_rmcr_migrated_member', transformation_ctx = "migrated_member")
+migrated_member_df = t_migrated_member.toDF()
+migrated_member_df.createOrReplaceTempView("migrated_member_df")
+
+member_df = spark.sql("""
+Select  t1.*,
+        CASE    WHEN (t1.registration_date < '2019-03-12 14:00') THEN 1 ELSE 0 END  AS registration_date_before_launch,              
+        CASE    WHEN (t1.registration_date < '2019-03-12 14:00') THEN 1 ELSE 0 END  AS  is_staff,  
+        '' as phone,
+        '' as hashedkey,
+        IFNULL(t2.is_migrated_ANY_MALL, 0) AS is_migrated_ANY_MALL  ,
+    	IFNULL(t2.is_migrated_APM, 0) AS is_migrated_APM            ,
+        IFNULL(t2.is_migrated_EPC, 0) AS is_migrated_EPC            ,
+    	IFNULL(t2.is_migrated_LN, 0) AS is_migrated_LN              ,
+    	IFNULL(t2.is_migrated_MOKO, 0) AS is_migrated_MOKO          ,
+    	IFNULL(t2.is_migrated_MP, 0) AS is_migrated_MP              ,
+    	IFNULL(t2.is_migrated_NTP, 0) AS is_migrated_NTP            ,
+    	IFNULL(t2.is_migrated_PC, 0) AS is_migrated_PC              ,
+    	IFNULL(t2.is_migrated_TPMM, 0) AS is_migrated_TPMM          ,
+    	IFNULL(t2.is_migrated_TWP, 0) AS is_migrated_TWP            ,
+    	IFNULL(t2.is_migrated_VCY, 0) AS is_migrated_VCY            ,
+    	IFNULL(t2.is_migrated_WTC, 0) AS is_migrated_WTC            ,
+    	IFNULL(t2.is_migrated_YLP, 0) AS is_migrated_YLP            ,
+    	IFNULL(t2.is_migrated_YM, 0) AS is_migrated_YM              ,
+        year(now() ) - age - case when month(now()  ) > t1.birthday_month  then 1 else 0 end as birthday_year
+from member_raw_df t1
+left join migrated_member_df t2 on t1.member_id = t2.member_id
+where DATE_FORMAT(t1.registration_date, 'yyyy-MM-dd') < date_format(now(),'yyyy-MM-dd')
+""")
+
+
+
+
+s3_folder = 'member'
+sep_by = ';'
+cdp_table_name = 'dm_member'
+save_df(member_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : device_info------------------------
+t_device_info = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'ods_device_info', transformation_ctx = "ods_device_info")
+device_info_df = t_device_info.toDF()\
+                             .filter("member_id is not null")
+s3_folder = 'member_device'
+sep_by = ';'
+cdp_table_name = 'dm_device_info'
+save_df(device_info_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : cleaned_dw_spending-----------------
+t_spending_raw = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "spending_raw")
+spending_df = t_spending_raw.toDF()\
+                            .withColumn('is_staff', when(col('registration_date') < to_date(to_timestamp(lit('2019-03-12 00:00:00') , "yyyy-MM-dd HH:mm:ss")), lit(1)).otherwise(lit(0)))\
+                            .withColumn('receipt_transaction_date_origin', col('receipt_transaction_date'))\
+                            .withColumn('receipt_upload_datetime_before_launch', lit(0) )\
+                            .withColumnRenamed('member_tier', 'membership_tier')\
+                            .filter("receipt_status_detail = 'Approved'")\
+                            .filter("receipt_upload_datetime >= '2019-03-12 14:00:00'")\
+                            .filter("receipt_transaction_date >= '2019-03-12'")\
+                            .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification')")\
+                            .filter("Team not in ('Partner')")\
+                            .filter("Abnormal_case = 0")\
+                            .filter("receipt_upload_date < current_date()")
+s3_folder = 'spending'
+sep_by = ';'
+cdp_table_name = 'dm_spending'
+save_df(spending_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : cleaned_dw_redemption------------------
+t_redemption_raw = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_redemption', transformation_ctx = "redemption_raw")
+redemption_raw_df = t_redemption_raw.toDF().withColumnRenamed('provider_mall_id', 'mall_id')\
+                                           .withColumnRenamed('provider_property_id', 'property_id')\
+                                           .withColumnRenamed('member_tier', 'membership_tier')\
+                                           .withColumn('redeemed_qty', lit(1))\
+                                           .withColumn('redeem_datetime_before_launch', when(col('redeem_date') < '2019-03-12', lit(1)).otherwise(lit(0)))
+
+redemption_df = redemption_raw_df.filter("redemption_status_detail not in ('Cancelled Redemption of Mall Gift (CCC) or Shop Gift / SHKP Mall e-Gift Certificate', 'Point + Cash Auto Cancellation')")\
+                                 .filter("redeem_datetime >= '2019-03-12 14:00:00'")\
+                                 .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification')")\
+                                 .filter("CONCAT(CAST(redeemed_bonus_points AS string), redeem_type, provider_property_id) not in ('0Redeem by bonus pointRMCR', '0Redeem by 0 pointRMCR')")\
+                                 .filter("Abnormal_case = 0")\
+                                 .filter("redeem_date < current_date()")
+s3_folder = 'redemption_raw'
+sep_by = ';'
+cdp_table_name = 'redemption_raw'
+save_df(redemption_raw_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+s3_folder = 'redemption'
+sep_by = ';'
+cdp_table_name = 'redemption'
+save_df(redemption_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_member_registration------------------
+t_registration = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_member_registration', transformation_ctx = "registration")
+registration_df = t_registration.toDF().withColumn('from_mall_id', when(col('from_mall_id')=='__HIVE_DEFAULT_PARTITION__', lit('NULL')).otherwise(col('from_mall_id')))
+
+s3_folder = 'registration_tracking'
+sep_by = ';'
+cdp_table_name = 'dm_registration_tracking'
+save_df(registration_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_bp_transaction------------------
+t_bp_transaction_raw = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_bp_transaction', transformation_ctx = "dw_bp_transaction")
+bp_transaction_raw_df = t_bp_transaction_raw.toDF().withColumnRenamed('member_tier', 'membership_tier')
+bp_transaction_df = bp_transaction_raw_df.filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification')")\
+                                         .filter("abnormal_case = 0")\
+                                         .filter("created_datetime_before_launch = 0")
+
+s3_folder = 'bonus_point_raw'
+sep_by = ';'
+cdp_table_name = 'dm_bonus_point_transaction_raw'
+save_df(bp_transaction_raw_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+s3_folder = 'bonus_point'
+sep_by = ';'
+cdp_table_name = 'dm_bonus_points_transaction_'
+save_df(bp_transaction_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_parking_entry------------------
+t_parking_entry = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_parking_entry', transformation_ctx = "dw_parking_entry")
+parking_entry_df = t_parking_entry.toDF()
+s3_folder = 'parking_entry'
+sep_by = ';'
+cdp_table_name = 'dm_parking_entry'
+save_df(parking_entry_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_parking_invoice------------------
+t_parking_invoice = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_parking_invoice', transformation_ctx = "dw_parking_invoice")
+parking_invoice_df = t_parking_invoice.toDF()
+s3_folder = 'parking_invoice_detail'
+sep_by = ';'
+cdp_table_name = 'dm_parking_invoice_detail'
+save_df(parking_invoice_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_parking_redemption------------------
+t_parking_redemption = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_parking_redemption', transformation_ctx = "dw_parking_redemption")
+parking_redemption_df = t_parking_redemption.toDF().withColumn('card_no', lit(''))
+s3_folder = 'parking_redemption'
+sep_by = ';'
+cdp_table_name = 'dm_parking_redemption'
+save_df(parking_redemption_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : member_mall_bonus_points------------------
+t_member_mall_bonus_points = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_mall_bonus_points', transformation_ctx = "member_mall_bonus_points")
+member_mall_bonus_points_df = t_member_mall_bonus_points.toDF()
+s3_folder = 'point_expiry'
+sep_by = ';'
+cdp_table_name = 'dm_point_expiry'
+save_df(member_mall_bonus_points_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_shop------------------
+t_shop = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_shop', transformation_ctx = "dw_shop")
+shop_df = t_shop.toDF()
+s3_folder = 'shop'
+sep_by = ';'
+cdp_table_name = 'dm_shop'
+save_df(shop_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_stamp_earn------------------
+t_stamp_earn = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_stamp_earn', transformation_ctx = "dw_stamp_earn")
+stamp_earn_df = t_stamp_earn.toDF()
+s3_folder = 'stamp_earn'
+sep_by = ';'
+cdp_table_name = 'dm_stamp_earn'
+save_df(stamp_earn_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_stamp_redemption------------------
+t_stamp_redemption = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_stamp_redemption', transformation_ctx = "dw_stamp_redemption")
+stamp_redemption_df = t_stamp_redemption.toDF().withColumn('gift_btn_text_tc', regexp_replace('gift_btn_text_tc', '\r\n', ' '))
+s3_folder = 'stamp_redemption'
+sep_by = ';'
+cdp_table_name = 'dm_stamp_redemption'
+save_df(stamp_redemption_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_stamp_spend------------------
+t_stamp_spend = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_stamp_member_spend', transformation_ctx = "dw_stamp_spend")
+stamp_spend_df = t_stamp_spend.toDF()
+s3_folder = 'stamp_member_spend'
+sep_by = ';'
+cdp_table_name = 'dm_stamp_member_spend'
+save_df(stamp_spend_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : member_activity_history------------------
+t_member_activity_history = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'ods_member_activity_history', transformation_ctx = "member_activity_history")
+member_activity_history_df = t_member_activity_history.toDF()
+s3_folder = 'member_activity_history'
+sep_by = ';'
+cdp_table_name = 'member_activity_history'
+save_df(member_activity_history_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : gift_inventory------------------
+t_gift_inventory = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_gift_inventory', transformation_ctx = "gift_inventory")
+gift_inventory_df = t_gift_inventory.toDF()
+gift_inventory_df.createOrReplaceTempView("gift_inventory")
+
+t_dim_gift_mapping = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_gift_mapping', transformation_ctx = "dim_gift_mapping")
+dim_gift_mapping_df = t_dim_gift_mapping.toDF()
+dim_gift_mapping_df.createOrReplaceTempView("dim_gift_mapping")
+
+final_gift_inventory = spark.sql("""
+Select t1.*, Business_Nature as gift_business_nature, LMS_Standard_Trade_Category as gift_trade_category, LMS_Standard_Brand_Name_Eng as gift_brand, Gift_Nature as gift_nature,
+'' as common_gift , '' as hotpick_gift, ''  as redemption_weekday, Face_Unit_Value_HK as gift_face_unit_value
+from gift_inventory t1
+left join dim_gift_mapping t2 on t1.gift_id = t2.The_Point_CMS_Gift_ID
+""")
+
+
+s3_folder = 'gift_inventory'
+sep_by = ';'
+cdp_table_name = 'gift_inventory'
+save_df(final_gift_inventory, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : dw_parker_identity------------------
+t_parker_identity = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_parker_identity', transformation_ctx = "dw_parker_identity")
+parker_identity_df = t_parker_identity.toDF().withColumn('card_no', lit(''))
+s3_folder = 'parker_identity'
+sep_by = ';'
+cdp_table_name = 'dm_parker_identity'
+save_df(parker_identity_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)

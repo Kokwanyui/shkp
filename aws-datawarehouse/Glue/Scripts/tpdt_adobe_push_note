@@ -1,0 +1,146 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType, IntegerType, FloatType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.window import Window
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+ 
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-adobe-dw/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    secret_name = "tpdt_cdp_redshift"
+    tmpdir = "s3://tpdt-data-from-cdp/redshift_tmpdir/"
+    artifacts_s3 = "tpdt-artifacts"
+    adobe_bucket='tpdt-adobe'
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-adobe-dw-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    secret_name = f'tpdt_cdp_redshift_{env}'
+    tmpdir = f"s3://tpdt-data-from-cdp-{env}/redshift_tmpdir/"
+    artifacts_s3 = "tpdt-artifacts-{env}"
+    adobe_bucket=f'tpdt-adobe-{env}'
+
+
+prefix = 'bi_dimension_'
+
+output_location = 's3://tpdt-adobe-dw/push_delivery_log/'
+
+
+def list_objects_with_prefix(bucket, prefix):
+    s3 = boto3.client('s3', region_name='ap-southeast-1')
+    
+    try:
+        objects = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)['Contents']
+    except:
+        objects = []
+    return objects
+
+
+def move_to_archive(bucket, source_object):
+    s3_resource = boto3.resource('s3', region_name='ap-southeast-1')
+    
+    # Copy object to archive
+    archive_path = source_object.replace('from_adobe/push_delivery_log', 'from_adobe_archive/push_archive')\
+                                .replace('from_adobe/push_tracking_log', 'from_adobe_archive/push_archive')
+    source_path = f'{bucket}/{source_object}'
+    s3_resource.Object(bucket, archive_path).copy_from(CopySource=source_path)
+    
+    # Delete Source Object
+    s3_resource.Object(bucket, source_object).delete()
+
+    
+#Get push_delivery_log--------------------------------------------------------------------------------------------------------
+bucket = adobe_bucket
+prefix = 'from_adobe/push_delivery_log/appDeliveryLog'
+push_delivery_output_location = output_path+'push_delivery_log/'
+
+objects = list_objects_with_prefix(bucket, prefix)
+
+if len(objects) > 0:
+    for object in objects:
+        object_path = object['Key']
+        full_path = f's3://{adobe_bucket}/{object_path}'
+                
+        push_delivery_df = spark.read.csv(full_path, header='true', inferSchema='true', sep='|')\
+                                        .withColumnRenamed('Delivery Log ID', 'Delivery_Log_ID')\
+                                        .withColumnRenamed('Delivery ID', 'Delivery_ID')\
+                                        .withColumnRenamed('Delivery Label', 'Delivery_Label')\
+                                        .withColumnRenamed('Last Modified Date', 'Last_Modified_Date')\
+                                        .withColumnRenamed('Event Date', 'event_date')\
+                                        .withColumnRenamed('Member ID', 'Member_ID')\
+                                        .withColumnRenamed('Is Test profile', 'Is_Test_profile')\
+                                        .withColumnRenamed('Campaign ID', 'Campaign_ID')\
+                                        .withColumnRenamed('Content Variant', 'Content_Variant')\
+                                        .withColumnRenamed('Delivery Status', 'Delivery_Status')\
+                                        .withColumnRenamed('Failure Type', 'Failure_Type')\
+                                        .withColumnRenamed('Failure Reason', 'Failure_Reason')\
+                                        .withColumnRenamed('Failure Message', 'Failure_Message')\
+                                        .withColumn('event_date', to_timestamp(col('event_date'),'yyyy-MM-dd HH:mm:ss'))\
+                                        .withColumn('Last_Modified_Date', to_timestamp(col('Last_Modified_Date'),'yyyy-MM-dd HH:mm:ss'))\
+                                        .withColumn('partition_key', substring(col('event_date'),1,10))
+        push_delivery_df.write.format('parquet').mode('append').partitionBy('partition_key').option("header",True).save(push_delivery_output_location)
+        move_to_archive(bucket, object_path)
+else:
+    pass
+
+    
+#Get push_tracking_log--------------------------------------------------------------------------------------------------------
+bucket = adobe_bucket
+prefix = 'from_adobe/push_tracking_log/PushNoteTrackingLog'
+push_tracking_output_location = output_path+'push_tracking_log/'
+
+objects = list_objects_with_prefix(bucket, prefix)
+
+if len(objects) > 0:
+    for object in objects:
+        object_path = object['Key']
+        full_path = f's3://{adobe_bucket}/{object_path}'
+                
+        push_tracking_df = spark.read.csv(full_path, header='true', inferSchema='true', sep='|')\
+                                        .withColumnRenamed('Tracking Log ID', 'Tracking_Log_ID')\
+                                        .withColumnRenamed('Log Date', 'Log_Date')\
+                                        .withColumnRenamed('Delivery ID', 'Delivery_ID')\
+                                        .withColumnRenamed('Delivery Log ID', 'Delivery_Log_ID')\
+                                        .withColumnRenamed('Campaign ID', 'Campaign_ID')\
+                                        .withColumnRenamed('Member ID', 'Member_ID')\
+                                        .withColumnRenamed('URL Type', 'URL_Type')\
+                                        .withColumnRenamed('URL category', 'URL_category')\
+                                        .withColumnRenamed('URL label', 'URL_label')\
+                                        .withColumnRenamed('Source URL', 'Source_URL')\
+                                        .withColumn('Log_Date', to_timestamp(col('Log_Date'),'yyyy-MM-dd HH:mm:ss'))\
+                                        .withColumn('partition_key', substring(col('Log_Date'),1,10))
+        push_tracking_df.write.format('parquet').mode('append').partitionBy('partition_key').option("header",True).save(push_tracking_output_location)
+        move_to_archive(bucket, object_path)
+else:
+    pass

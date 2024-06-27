@@ -1,0 +1,294 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from dateutil.relativedelta import relativedelta
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+# spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db02 = "tpdt_02replica"
+    db03 = "tpdt_03dw"
+    db03sub = "tpdt_03sub"
+    db03segment = "tpdt_03segmentation"
+    db03parking = "tpdt_03parking"
+    output_path = "s3://shkpcdp-thepoint-input/"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+    district_mapping_s3_location = 's3://tpdt-dimension/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    db03sub = "tpdt_03sub_" + env
+    db03segment = "tpdt_03segmentation_" + env
+    output_path = "s3://" + env + "shkpcdp-thepoint-input/"
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+    district_mapping_s3_location = 's3://tpdt-dimension-' + env + '/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+
+prefix = "shkpmalls_vip_"
+prefix03 = 'tpdt_'
+bi_prefix = 'bi_datamart_'
+
+now = datetime.datetime.now().date()
+query_script = ""
+
+####################################################  Part 1  ###################################################################
+start_date_list = {}
+start_date_list['2019-03-12'] = 'Ever'
+start_date_list[(now - relativedelta(months=3)).strftime("%Y-%m-%d")] = 'P3M'
+start_date_list[(now - relativedelta(months=6)).strftime("%Y-%m-%d")] = 'P6M'
+start_date_list[(now - relativedelta(years=1)).strftime("%Y-%m-%d")] = 'P12M'
+
+# ------------------------------------------------- datamart : dm_spending_master -------------------------------------------------------------------------------
+t_spending_raw = glueContext.create_dynamic_frame.from_catalog(database=db03, table_name=prefix03 + 'dw_spending',
+                                                               transformation_ctx="spending_raw")
+spending_df = t_spending_raw.toDF() \
+    .filter("receipt_status_detail = 'Approved'") \
+    .filter("receipt_upload_datetime >= '2019-03-12 14:00:00'") \
+    .filter("receipt_transaction_date >= '2019-03-12'") \
+    .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification')") \
+    .filter("Team not in ('Partner')") \
+    .filter("Abnormal_case = 0") \
+    .filter("receipt_upload_date < current_date()")
+spending_df.createOrReplaceTempView("dm_spending_master")
+
+for keys in start_date_list:
+    query_script_loop1 = """ 
+    select member_id , concat('Member_Spend','_' ,property_id ,'_' ,'""" + start_date_list[keys] + """') as adobe_id  , CAST(sum(receipt_amount) as Decimal(38,1))  as pre_value
+    from  dm_spending_master
+    where receipt_transaction_date between '""" + keys + """' and current_date  
+    group by member_id ,property_id
+
+    union all 
+    """
+
+    query_script = query_script + query_script_loop1
+
+    query_script_loop2 = """ 
+    select member_id , concat('Member_Spend','_' ,'Total_Malls' ,'_' , '""" + start_date_list[keys] + """') as adobe_id  , CAST(sum(receipt_amount) as Decimal(38,1))  as pre_value
+    from  dm_spending_master
+    where receipt_transaction_date between '""" + keys + """' and current_date  
+    group by member_id  
+
+    union all 
+    """
+
+    query_script = query_script + query_script_loop2
+
+########################################################### ################## ##########################################################
+
+
+####################################################  Part 2  ###################################################################
+list_for_point = {}
+
+# /*the logic is wrong when the date turn to 2021*/
+# list_for_point[datetime.datetime(now.year, now.month-2, 1).strftime("%Y-%m-%d")]='P2MTD'
+# list_for_point[datetime.datetime(now.year, now.month-1, 1).strftime("%Y-%m-%d")]='MTD'
+
+
+last_updated_date = (now - relativedelta(days=1))
+last_updated_date_previous_month = (last_updated_date - relativedelta(months=1))
+
+list_for_point[
+    datetime.datetime(last_updated_date_previous_month.year, last_updated_date_previous_month.month, 1).strftime(
+        "%Y-%m-%d")] = 'P2MTD'
+list_for_point[datetime.datetime(last_updated_date.year, last_updated_date.month, 1).strftime("%Y-%m-%d")] = 'MTD'
+
+t_bp_transaction = glueContext.create_dynamic_frame.from_catalog(database=db03,
+                                                                 table_name=prefix03 + 'dw_bp_transaction',
+                                                                 transformation_ctx="dw_bp_transaction")
+bp_transaction_df = t_bp_transaction.toDF()
+bp_transaction_df.createOrReplaceTempView("dm_bonus_points_transaction_master_raw")
+
+for points_keys in list_for_point:
+    query_points_loop1 = """ 
+    select member_id, concat('Point_Earned_Total_Malls_' , '""" + list_for_point[points_keys] + """') as adobe_id , CAST( sum(case when points > 0  OR bp_transaction_type = 'A'  then points else 0 end) as Decimal(38,1)) as pre_value 
+    from dm_bonus_points_transaction_master_raw where bp_transaction_type != 'E' 
+    and created_date between '""" + points_keys + """' and current_date
+    group by member_id
+
+    union all 
+    """
+
+    query_script = query_script + query_points_loop1
+
+    query_points_loop2 = """ 
+    select member_id, concat('Point_Burnt_Total_Malls_' , '""" + list_for_point[points_keys] + """') as adobe_id , CAST( sum(case when points < 0 and bp_transaction_type <> 'A' then points else 0 end) as Decimal(38,1)) as pre_value 
+    from dm_bonus_points_transaction_master_raw where bp_transaction_type != 'E' 
+    and created_date between '""" + points_keys + """' and current_date
+    group by member_id
+
+    union all 
+    """
+
+    query_script = query_script + query_points_loop2
+
+########################################################### ################## ##########################################################
+
+
+####################################################  Part 3  ###################################################################
+
+# ------------------------------------------------- source table : Professional Buyers -------------------------------------------------------------------------------
+t_professional_buyer_specific_list = glueContext.create_dynamic_frame.from_catalog(database=db03segment,
+                                                                                   table_name=prefix03 + 'professional_buyer_specific_list',
+                                                                                   transformation_ctx="professional_buyer_specific_list")
+professional_buyer_specific_list_df = t_professional_buyer_specific_list.toDF()
+
+# t_pb_df = spark.read.csv('s3://shkpcdp-thepoint/ODS/ods_professional_buyer_incremental_list.csv', header='true', inferSchema='true', sep=';')
+professional_buyer_specific_list_df.createOrReplaceTempView("ods_professional_buyer_incremental_list")
+
+query_points_pb = """ 
+select member_id , 'Is_Professional_Buyer_Total_Malls_Ever' as adobe_id , '1' as pre_value 
+from ods_professional_buyer_incremental_list
+
+union all 
+"""
+
+query_script = query_script + query_points_pb
+
+########################################################### ################## ##########################################################
+
+
+####################################################  Part 4  ###################################################################
+
+# ------------------------------------------------- source table : Member_Segment_Latest_Month_Segment + Member_Master_Segment_Latest_Month_Segment + Member_Segment_Latest_Active_Segment + Member_Master_Segment_Latest_Active_Segment -------------------------------------------------------------------------------
+t_ms_1 = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                       table_name=bi_prefix + 'dm_ogilvy_member_segment_latest_month_segment',
+                                                       transformation_ctx="Member_Segment_Latest_Month_Segment")
+t_ms_1_df = t_ms_1.toDF()
+t_ms_1_df.createOrReplaceTempView("dm_ogilvy_member_segment_latest_month_segment")
+
+t_ms_2 = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                       table_name=bi_prefix + 'dm_ogilvy_member_segment_latest_active_segment',
+                                                       transformation_ctx="Member_Segment_Latest_Active_Segment")
+t_ms_2_df = t_ms_2.toDF()
+
+t_ms_2_df.createOrReplaceTempView("dm_ogilvy_member_segment_latest_active_segment")
+
+query_points_ms = """ 
+select member_id , 'Member_Segment_Latest_Month' as adobe_id , segment as pre_value 
+from dm_ogilvy_member_segment_latest_month_segment where length(segment)>0 and segment is not null
+union all
+select member_id, 'Member_Master_Segment_Latest_Month' as adobe_id, master_segment as pre_value
+from dm_ogilvy_member_segment_latest_month_segment where length(master_segment)>0 and master_segment is not null
+union all
+select member_id, 'Member_Segment_Latest_Active' as adobe_id, segment as pre_value
+from dm_ogilvy_member_segment_latest_active_segment where length(segment)>0 and segment is not null
+union all
+select member_id, 'Member_Master_Segment_Latest_Active' as adobe_id, master_segment as pre_value
+from dm_ogilvy_member_segment_latest_active_segment where length(master_segment)>0 and master_segment is not null
+union all 
+"""
+
+query_script = query_script + query_points_ms
+
+# ------------------------------------------------- source table : device_info -------------------------------------------------------------------------------
+t_device_info = glueContext.create_dynamic_frame.from_catalog(database=db03, table_name=prefix03 + 'ods_device_info',
+                                                              transformation_ctx="ods_device_info")
+device_info_df = t_device_info.toDF()
+device_info_df.createOrReplaceTempView("device_info")
+
+query_device_info = """
+select distinct member_id, 'Member_App_Login_Ever' as adobe_id , 1 as pre_value
+from device_info where member_id is not NULL
+union all
+"""
+
+query_script = query_script + query_device_info
+
+# ------------------------------------------------- source table : dm_parker_identity  -------------------------------------------------------------------------------
+t_parker_identity = glueContext.create_dynamic_frame.from_catalog(database=db03parking,
+                                                                  table_name=prefix03 + 'dw_parker_identity',
+                                                                  transformation_ctx="dw_parker_identity")
+parker_identity_df = t_parker_identity.toDF()
+parker_identity_df.createOrReplaceTempView("dm_parker_identity")
+
+query_parker_identity = """
+select distinct x.member_id, 'Member_Parker_Type_Latest' as adobe_id, case when x.max_is_contactless_carplate = 1 then 'Contactless Parker' else 'Non-Contactless Parker' end as pre_value
+from (select member_id, max(is_contactless_carplate) as max_is_contactless_carplate, max(is_member_parking_carplate) as max_is_member_parking_carplate from dm_parker_identity group by member_id) x
+union all
+"""
+
+query_script = query_script + query_parker_identity
+
+########################################################### ################## ##########################################################
+
+
+query_end = """ select '' as member_id , '' as adobe_id , ''  as pre_value  """
+query_script = query_script + query_end
+
+temp_sp = spark.sql(query_script)
+temp_sp.createOrReplaceTempView("temp")
+
+# ------------------------------------------------- Mapping : Adobe Pre Calculation Id -------------------------------------------------------------------------------
+t_adobe_precal_id_list = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                                       table_name=bi_prefix + 'tpdt_dim_adobe_precal_id_list',
+                                                                       transformation_ctx="tpdt_dim_adobe_precal_id_list")
+adobe_precal_id_list_df = t_adobe_precal_id_list.toDF()
+adobe_precal_id_list_df.createOrReplaceTempView("tpdt_dim_adobe_precal_id_list")
+
+# temp_end = spark.sql("""
+# select member_id ,  adobe_id as id , pre_value as value , 'TPBI1.1' as version , current_date as createdDate , '9999-12-31' as endDate
+# from temp where member_id <>""
+# """)
+
+
+temp_end = spark.sql("""
+select t1.member_id as memberID ,  t2.id as id , pre_value as value , 'TPBI1.1' as version , current_date as createdDate , 
+case when t2.columnname like 'Member_Spend_%' then date_add(current_date, 1)
+when t2.columnname like 'Point_Burnt_%' then date_add(current_date, 1)
+when t2.columnname like 'Point_Earned_%' then date_add(current_date, 1)
+else '9999-12-31' end as endDate
+from temp t1  left join tpdt_dim_adobe_precal_id_list t2 on t1.adobe_id=t2.columnname
+where t1.member_id <>""  
+""")
+
+
+## udfs
+def save_df(df, separator, root_folder):
+    # clean all objects in folder
+    s3 = boto3.resource('s3')
+    clean_bucket = s3.Bucket('shkpcdp-thepoint-input')
+    clean_prefix = f'{root_folder}/input/'
+    clean_bucket.objects.filter(Prefix=clean_prefix).delete()
+
+    # save temp file
+    output_path = f"s3://shkpcdp-thepoint-input/{root_folder}/input"
+    df.write.mode("overwrite").option("timestampFormat", "yyyy-MM-dd HH:mm:ss").option("dateFormat", "yyyy-MM-dd").option("compression", "gzip").csv(output_path, header="true", sep=separator)
+
+    # Create a blank folder
+    success_folder_key = f'{root_folder}/input/_SUCCESS/'
+    s3.Object('shkpcdp-thepoint-input', success_folder_key).put()
+
+
+s3_folder = 'member_feature'
+sep_by = ';'
+cdp_table_name = 'member_feature'
+save_df(temp_end, sep_by, s3_folder)
+print(f"Result saved in {s3_folder}...")
+

@@ -1,0 +1,56 @@
+
+# Creating Redshift Resources - Start
+  # Creating Redshift SubnetGroup - Start
+  RedShiftClusterSubnetGroup:
+    Type: AWS::Redshift::ClusterSubnetGroup
+    Properties:
+      Description: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - redshift-private-subnet-group
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      SubnetIds:
+        - !Ref PrivateSubnet1ID
+        - !Ref PrivateSubnet2ID
+        - !Ref PrivateSubnet3ID
+  # Creating Redshift SubnetGroup- End
+
+  # Creating Redshift Cluster - Start
+  RedShiftTP03Cluster:
+    Type: AWS::Redshift::Cluster
+    Properties:
+      AutomatedSnapshotRetentionPeriod: !Ref RedShiftSnapshotRetentionPeriod
+      AllowVersionUpgrade: true
+      ClusterSubnetGroupName: !Ref RedShiftClusterSubnetGroup
+      ClusterType: !Ref RedShiftClusterType
+      ClusterIdentifier: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - redshift-private-cluster
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      ClusterVersion: 1
+      DBName: !Join
+        - '_'
+        - - !Ref AWSTeam
+          - db03
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Encrypted: false
+      MasterUsername: !Sub '{{resolve:secretsmanager:${SecretManagerNameRedshiftTP03}:SecretString:redshift_tp03_master}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${SecretManagerNameRedshiftTP03}:SecretString:redshift_tp03_master_pw}}'
+      NodeType: !Ref RedShiftNodeType
+      NumberOfNodes: !Ref RedShiftNumberOfNodes
+      PreferredMaintenanceWindow: !Ref RedShiftPreferredMaintenanceWindow
+      PubliclyAccessible: false
+      VpcSecurityGroupIds:
+        - !Ref RedShiftVPCSecurityGroupID
+  # Creating Redshift Cluster - End
+# Creating Redshift Resources - End

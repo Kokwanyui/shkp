@@ -1,0 +1,375 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    db03redshift = "tpdt_03redshift"
+    output_path="s3://tpdt-dw/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    district_mapping_s3_location = 's3://tpdt-dimension/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    district_mapping_s3_location = 's3://tpdt-dimension-'+env+'/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+delta_date = ((datetime.today() + timedelta(hours=8)) - timedelta(days=90)).strftime('%Y-%m-%d')
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : bonus_points_transaction
+bp_hashexpression = {"hashexpression": "bonus_points_transaction_id", "Hashpartitions": "10"}
+t_bpt_df = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'bonus_points_transaction', transformation_ctx = "bonus_points_transaction", additional_options=bp_hashexpression)
+bpt_df = t_bpt_df.toDF().filter(expr(f"to_date(created_date - interval 8 hours) >= cast('{delta_date}' as date)"))
+print("Source Extraxtion Finished: bonus_points_transaction...")
+
+##source table : member_mall_bonus_points
+t_member_mall_bonus_points_df = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_mall_bonus_points', transformation_ctx = "member_mall_bonus_points")
+mmmbp_df = t_member_mall_bonus_points_df.toDF().filter(expr(f"to_date(created_date - interval 8 hours) >= cast('{delta_date}' as date)"))
+print("Source Extraxtion Finished: member_mall_bonus_points...")
+
+## mapping table : dim_tp_district_mapping.csv from S3
+district_df = spark.read.csv(district_mapping_s3_location, header='true', inferSchema='true', sep=',')
+print("Source Extraction Finished: dim_tp_district_mapping...")
+
+##source table : member_mall_bonus_points_mapping
+t_member_mall_bonus_points_mapping = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_mall_bonus_points_mapping', transformation_ctx = "member_mall_bonus_points_mapping")
+member_mall_bonus_points_mapping_df = t_member_mall_bonus_points_mapping.toDF()
+print("Source Extraction Finished: member_mall_bonus_points_mapping...")
+
+##mapping table : member
+t_member_staging= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_member', transformation_ctx = "staging_member")
+member_df = t_member_staging.toDF()
+print("Source Extraxtion Finished: member...")
+
+
+## mapping table : dim_tp_mall_mapping.csv from S3
+mall_mapping_df = spark.read.csv(dimension_path+'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv', header='true', inferSchema='true', sep=',')
+print("Source Extraxtion Finished: dim_tp_mall_mapping.csv...")
+
+## mapping table : staging_gift_content
+t_gift_content= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_gift_content', transformation_ctx = "staging_gift_content")
+gift_content_df = t_gift_content.toDF()
+print("Source Extraxtion Finished: staging_gift_content...")
+
+## mapping table : staging_coupon_content
+t_coupon_content= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_coupon_content', transformation_ctx = "staging_coupon_content")
+coupon_content_df = t_coupon_content.toDF()
+print("Source Extraxtion Finished: staging_coupon_content...")
+
+## bp transaction master before delta
+t_bp_tranx_before_delta = glueContext.create_dynamic_frame.from_catalog(database = db03redshift, table_name=prefix03 + 'dw_dw_bp_transaction', redshift_tmp_dir="s3://tpdt-athena-queryresult", transformation_ctx="redshift_dw_bp_transaction_before_delta")
+bp_tranx_before_delta_df = t_bp_tranx_before_delta.toDF().filter(f"created_date < '{delta_date}'").drop('member_status_detail', 'gender', 'age', 'age_group', 'residence', 'district', 'member_tier', 'is_staff')
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Transformation 1: Adjust the expiry date
+def adj_date(from_date, to_date, default_date):
+    if from_date != to_date:
+        adjusted = to_date
+    else:
+        adjusted = default_date
+    return adjusted
+
+adj_date_udf = udf(adj_date, TimestampType())
+
+
+# Transformation 2: Prepare Dictionaries for mapping
+# For bonus_points_transaction.action
+bp_transaction_type_detail = {
+    'A': 'Adjusted Points (+/-) or GoRoyal or Point Dollar',
+	'D': 'Point Earned by Special Promotion (+) or Partner Point Conversion',
+	'S': 'Point Earned by Spending (+)',
+	'G': 'Point Burnt by Spending Gift (-)',
+	'R': 'Point Burnt by Mall Gift (Redeemed at CCC) (-)',
+	'C': 'Point Burnt by Shop Gift / SHKP Mall e-Gift Certificate (-)',
+	'E': 'Deduction of Forfeited Bonus Point (-)',
+	'T': 'Point Burnt by Event (-)',
+	'M': 'Point Burnt by Point + Cash Gift (-)'
+    }
+
+def bpt_type_detail_2(action, adjust_reason_lang1, name_lang1):
+    if action == 'A':
+        detail = adjust_reason_lang1
+    elif action == 'D':
+        detail = name_lang1
+    else:
+        detail = None
+    return detail
+
+bpt_type_detail_2_udf = udf(bpt_type_detail_2, StringType())
+'''
+# For member.status
+member_status_detail = {
+    'W': 'Waiting for verification',
+	'A': 'Active',
+	'L': 'Locked',
+	'S': 'Suspended',
+	'V':'Invalid'
+    }
+
+# For member.title
+gender = {
+    '1': 'Male',
+	'2': 'Female',
+	'3': 'Female'
+    }
+
+# For member.age to age group
+def age_group(age_column):
+    age = age_column
+    if age >= 75:
+        group = '75+'
+    elif 11 <= age <= 17:
+        group = '11 - 17'
+    elif 18 <= age <= 24:
+        group = '18 - 24'
+    else:
+        min = (age % 5) * 5
+        max = min + 9
+        group = str(min)+' - '+str(max)
+    return group
+
+age_group_udf = udf(lambda y:age_group(y), StringType())
+'''
+
+# Transformation 3: Adjust mall id
+def adjust_mallid(action, coupon_mall, gift_mall, original_mall):
+    if action in ('G','R'):
+        adjusted_mall = gift_mall
+    elif action in ('C'):
+        adjusted_mall = coupon_mall
+    else:
+        adjusted_mall = original_mall
+    return adjusted_mall
+
+adjust_mallid_udf = udf(adjust_mallid, StringType())
+
+
+# Transformation 4: Select columns and cleaning for bonus_points_transaction
+bpt_staging_df = bpt_df.select(col('bonus_points_transaction_id'),
+                               col('created_by'),
+                               col('created_date').alias("created_datetime"),
+                               to_date(col('created_date')- expr("INTERVAL 8 HOURS")).alias('created_date').cast(DateType()),
+                               col('action'),
+                               col('mall_id'),
+                               col('member_mall_bonus_points_id'),
+		                       col('points'),
+		                       col('adjust_reason_lang1'),
+                        	   upper(col('member_id')).alias('member_id'),
+                        	   col('spending_transaction_id'),
+		                       col('redemption_transaction_id'),
+		                       col('campaign_id'),
+		                       col('remark'))\
+		                       .withColumn('remark', regexp_replace(col("remark"), "[\n\r]", ""))
+bpt_staging_df.persist()
+print('Transformation: bonus_points_transaction cleaned')
+
+
+# Transformation 5: Unnest Json in bonus_points_transaction.matched_rules_json and join back to bonus_points_transaction
+extra_offer_df = bpt_df.filter((~bpt_df['action'].isin(['E', 'S'])) & (bpt_df['matched_rules_json'].isNotNull())).select(col('bonus_points_transaction_id').alias('mapping_bpt_id'), 'matched_rules_json')
+
+json_schema = spark.read.json(bpt_df.rdd.map(lambda row: row.matched_rules_json)).schema
+extra_offer_df = extra_offer_df.withColumn('json', from_json(col('matched_rules_json'), json_schema))\
+                                 .withColumn('base_offer', col('json').base_offer.cast(StringType()))\
+                                 .withColumn('matched_date', col('json').matched_date.cast(StringType()))\
+                                 .withColumn('json', explode(col('json').extra_offer))\
+                                 .withColumn('object_id', col('json').object_id.cast(StringType()))\
+                                 .withColumn('name_lang1', col('json').name_lang1.cast(StringType()))\
+                                 .withColumn('name_lang2', col('json').name_lang2.cast(StringType()))\
+                                 .withColumn('name_lang3', col('json').name_lang3.cast(StringType()))\
+                                 .withColumn('bonus_points', col('json').bonus_points.cast(StringType()))\
+                                 .drop('matched_rules_json', 'json')
+
+base_offer_df = bpt_df.filter((bpt_df['action'].isin(['S'])) & (bpt_df['matched_rules_json'].isNotNull()))\
+                       .select(col('bonus_points_transaction_id').alias('mapping_bpt_id'), 'matched_rules_json')
+json_schema2 = spark.read.json(base_offer_df.rdd.map(lambda row: row.matched_rules_json)).schema
+base_offer_df= base_offer_df.withColumn('json', from_json(col('matched_rules_json'), json_schema))\
+                             .withColumn('base_offer', col('json').base_offer.cast(StringType()))\
+                             .withColumn('matched_date', col('json').matched_date.cast(StringType()))\
+                             .withColumn('object_id', lit(None).cast(StringType()))\
+                             .withColumn('name_lang1', lit(None).cast(StringType()))\
+                             .withColumn('name_lang2', lit(None).cast(StringType()))\
+                             .withColumn('name_lang3', lit(None).cast(StringType()))\
+                             .withColumn('bonus_points', lit(None).cast(StringType()))\
+                             .drop('matched_rules_json', 'json')
+
+bpt_json_df = extra_offer_df.union(base_offer_df)
+
+bpt_staging_df = bpt_staging_df.join(bpt_json_df, bpt_staging_df.bonus_points_transaction_id == bpt_json_df.mapping_bpt_id, how = 'left')
+print('Transformation: Json Unnested')
+
+# Transformation 6: Apply adj_date_udf in Tranformation 1
+adjusted_mmbp = mmmbp_df.withColumn('expiry_date2', when(year(mmmbp_df.expiry_date) < 1970, to_timestamp(lit('1970-01-01 23:59:59'),'yyyy-MM-dd HH:mm:ss')).otherwise(mmmbp_df.expiry_date))\
+                        .join(member_mall_bonus_points_mapping_df, mmmbp_df.member_mall_bonus_points_id == member_mall_bonus_points_mapping_df.from_member_mall_bonus_points_id , how ="left")
+
+adjusted_mmbp = adjusted_mmbp.select(col('member_mall_bonus_points_id').alias('mapping_mmbp_id'),
+                                mmmbp_df.updated_date,
+                                col('expiry_date2'),
+                                member_mall_bonus_points_mapping_df.from_expiry_date ,
+                                member_mall_bonus_points_mapping_df.to_expiry_date)
+adjusted_mmbp = adjusted_mmbp.withColumn('final_expirydate', adj_date_udf('from_expiry_date', 'to_expiry_date', 'expiry_date2'))
+print('Transformation: Expiry Date Adjusted')
+
+# Transformation 7: Join data to bonus_points_transaction
+# join with Transformation 2, bonus_points_transaction.action
+bpt_type_detail_df = spark.createDataFrame(bp_transaction_type_detail.items(),schema=StructType(fields=[
+                                                                                                StructField("mapping_action", StringType()),
+                                                                                                StructField("bp_transaction_type_detail", StringType())]))
+
+bpt_staging_df = bpt_staging_df.join(bpt_type_detail_df, bpt_staging_df.action == bpt_type_detail_df.mapping_action, how = 'left')\
+                               .withColumn('bp_transaction_type_detail_2', bpt_type_detail_2_udf('action', 'adjust_reason_lang1', 'name_lang1'))\
+                               .join(adjusted_mmbp, bpt_staging_df.member_mall_bonus_points_id == adjusted_mmbp.mapping_mmbp_id, how = 'left') # join with expiry date and updated date
+print('Transformation: bonus_points_transaction Ready')
+'''
+# Transformation 8: Select columns and Mapping for member
+member_staging_df = member_df.select(col('member_id').alias('mapping_member_id'),
+                                     col('status'),
+                                     col('title'),
+                                     col('age'),
+                                     col('city_lang1'),
+                                     col('district'),
+                                     col('country_lang1'))
+
+member_staging_df.persist()
+member_status_detail_df = spark.createDataFrame(member_status_detail.items(),schema=StructType(fields=[
+                                                                                    StructField("mapping_status", StringType()),
+                                                                                    StructField("member_status_detail", StringType())]))
+gender_df = spark.createDataFrame(gender.items(),schema=StructType(fields=[
+                                                        StructField("mapping_title", StringType()),
+                                                        StructField("gender", StringType())]))
+
+member_staging_df = member_staging_df.join(member_status_detail_df, member_staging_df.status == member_status_detail_df.mapping_status, how = 'left')
+member_staging_df = member_staging_df.join(gender_df, member_staging_df.title == gender_df.mapping_title, how = 'left')
+member_staging_df = member_staging_df.withColumn('age_group', age_group_udf('age'))
+print('Transformation: Member Ready')
+'''
+
+# Transformation 9: Adjust Mall id and property id
+shorten_gift_content_df = gift_content_df.select('gift_id', col('mall_id').alias('gift_mall_id'))
+bpt_staging_df = bpt_staging_df.join(shorten_gift_content_df, bpt_staging_df.object_id == shorten_gift_content_df.gift_id, how = 'left')
+
+shorten_coupon_content_df = coupon_content_df.select('coupon_id', col('mall_id').alias('coupon_mall_id'))
+bpt_staging_df = bpt_staging_df.join(shorten_coupon_content_df, bpt_staging_df.object_id == shorten_coupon_content_df.coupon_id, how = 'left')
+
+bpt_staging_df = bpt_staging_df.withColumn('final_mall_id', adjust_mallid_udf('action', 'coupon_mall_id', 'gift_mall_id', 'mall_id'))
+
+# Assign Property Id according to final mall id
+shorten_mall_mapping_df = mall_mapping_df.select(col('mall_id').alias('mapping_mall_id'), col('property_id'))
+bpt_staging_df  =  bpt_staging_df.join(shorten_mall_mapping_df, bpt_staging_df.final_mall_id == shorten_mall_mapping_df.mapping_mall_id, how = 'left')
+print(bpt_staging_df.printSchema())
+
+# Transformation 10: tpdt_dw_bonus_point_transaction final schema
+bp_tranx_delta_df = bpt_staging_df.select('bonus_points_transaction_id',
+                                            'created_by',
+                                            'created_datetime',
+                                            'created_date',
+                                            'points',
+                                            'member_id',
+                                            'spending_transaction_id',
+                                            'redemption_transaction_id',
+                                            'remark',
+                                            col('action').alias('bp_transaction_type'),
+                                            col('bp_transaction_type_detail').alias('bp_transaction_type_detail_1'),
+                                            trim(col('bp_transaction_type_detail_2')).alias('bp_transaction_type_detail_2'),
+                                            col('final_expirydate').alias('expiry_date'),
+                                            lit(0).alias('abnormal_case'),
+                                            when(col('created_datetime') < '2019-03-12 14:00', lit(1)).when((col('created_datetime') == '2019-03-13 00:00:00')&(col('action') == 'A')&(col('remark') == 'Clean-up adjustment'), lit(1)).otherwise(lit(0)).alias('created_datetime_before_launch'),
+                                            col('final_mall_id').alias('mall_id'),
+                                            'property_id',
+                                            'campaign_id',
+                                            'updated_date',
+                                            col('created_date').alias('paritionkey'))\
+                                            .distinct()
+
+tpdt_dw_bp_tranx_raw = bp_tranx_delta_df.union(bp_tranx_before_delta_df).distinct()
+
+# Transformation 11: Join bonus_points_transaction and member
+tpdt_dw_bp_tranx_raw2 = tpdt_dw_bp_tranx_raw.join(member_df, tpdt_dw_bp_tranx_raw.member_id == member_df.mapping_member_id, how='inner')
+
+
+dw_bp_tranx_final = tpdt_dw_bp_tranx_raw2.select('bonus_points_transaction_id',
+                                                'created_by',
+                                                'created_datetime',
+                                                'created_date',
+                                                'points',
+                                                'member_id',
+                                                'spending_transaction_id',
+                                                'redemption_transaction_id',
+                                                'remark',
+                                                'bp_transaction_type',
+                                                'bp_transaction_type_detail_1',
+                                                'bp_transaction_type_detail_2',
+                                                'expiry_date',
+                                                'abnormal_case',
+                                                'created_datetime_before_launch',
+                                                'age',
+                                                'age_group',
+                                                'residence',
+                                                'district',
+                                                'member_tier',
+                                                'member_status_detail',
+                                                when(col('registration_date') < '2019-03-12', lit(1)).otherwise(lit(0)).alias('is_staff'),
+                                                'gender',
+                                                'mall_id',
+                                                'property_id',
+                                                'campaign_id',
+                                                'updated_date',
+                                                'paritionkey')\
+                                                .filter('member_id != "SHKP0519009"')\
+                                                .distinct()
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+dw_bp_tranx_final.write.format('parquet').mode('overwrite').partitionBy('paritionkey').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

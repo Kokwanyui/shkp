@@ -1,0 +1,66 @@
+variables:
+    AWSTeam: tpdt
+    ver: '202203171147' #cloud formation change set name, suggest use current datetime
+
+
+
+stages:
+    - workflow
+    - S3Artifacts
+    - UploadFiles
+    - ChangeSet
+
+workflow:
+    rules:
+    - if: '$CI_COMMIT_REF_NAME == "dev"'
+      variables:
+        awsEnv: "dev"
+        DEPLOY_ENV: "develpoment"
+        AWS_CLI_PROFILE: "shkpmalls-dev"
+        AWS_CLI_REGION: "ap-east-1"
+        AUTO_DEPLOY: "enable"
+        Env_Prefix: "shkp-"
+        BUCKET_VARIABLE: "-dev"
+    - if: '$CI_COMMIT_REF_NAME == "uat"'
+      variables:
+        awsEnv: "uat"
+        DEPLOY_ENV: "uat"
+        AWS_CLI_PROFILE: "shkpmalls-situat"
+        AWS_CLI_REGION: "ap-east-1"
+        AUTO_DEPLOY: "enable"
+        Env_Prefix: "shkp-"
+        BUCKET_VARIABLE: "-uat"
+    - if: '$CI_COMMIT_REF_NAME == "prod"'
+      variables:
+        awsEnv: "prod"
+        DEPLOY_ENV: "production"
+        AWS_CLI_PROFILE: "shkpmalls-prod"
+        AWS_CLI_REGION: "ap-east-1"
+        AUTO_DEPLOY: "enable"
+        Env_Prefix: "shkp-"
+        BUCKET_VARIABLE: ""
+
+create-s3-artifacts-busket:
+    stage: S3Artifacts
+
+    script:
+      - sh ./CICD/Full_deployment/artifacts_bucket.sh ${AWSTeam} ${awsEnv} ${AWS_CLI_REGION} ${AWS_CLI_PROFILE}
+    tags:
+      - gitlab-runner-aws-tpdt
+
+Upload-files-from-git:
+    stage: UploadFiles
+
+    script:
+      - aws s3 cp ./ s3://${AWSTeam}-artifacts${BUCKET_VARIABLE}/ --recursive --exclude ".git*"  --profile ${AWS_CLI_PROFILE} --region ${AWS_CLI_REGION}
+    tags:
+      - gitlab-runner-aws-tpdt
+
+
+changeset-in-env:
+    stage: ChangeSet
+
+    script:
+      - sh ./CICD/Change_Set/change_set.sh ${Env_Prefix} ${AWSTeam} ${awsEnv} ${AWS_CLI_PROFILE} ${AWS_CLI_REGION}
+    tags:
+      - gitlab-runner-aws-tpdt

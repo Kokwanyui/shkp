@@ -1,0 +1,150 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql.window import Window
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    db03sub="tpdt_03sub"
+    db03fd="tpdt_03foodordering"
+    output_path="s3://tpdt-staging/tpdt_earned_points/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    foodorder_path="s3://tpdt-foodordering/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    db03fd="tpdt_03foodordering"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    foodorder_path="s3://tpdt-foodordering-"+env+"/"
+
+
+dimension_prefix = "bi_dimension_"
+prefix="shkpmalls_vip_"
+prefix03="tpdt_"
+
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : receipt
+t_receipt = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'receipt', transformation_ctx = "receipt")
+receipt_df = t_receipt.toDF().filter("to_date(updated_date) > '2021-12-31'")
+receipt_df.createOrReplaceTempView("receipt")
+print("Source Extraction Finished: receipt...")
+
+##source table : spending_transaction
+t_spending_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_transaction', transformation_ctx = "spending_transaction")
+spending_transaction_df = t_spending_transaction.toDF().filter("to_date(updated_date) > '2021-12-31'")
+spending_transaction_df.createOrReplaceTempView("spending_transaction")
+print("Source Extraxtion Finished: spending_transaction...")
+
+
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+earned_point = spark.sql("""
+			SELECT
+			 r.receipt_id as mapping_receipt_id,
+			 r.spending_transaction_id as  spending_transaction_id2,
+             CASE WHEN  st.earned_points - COALESCE(SUM(r2.amount), 0)  > r.amount  THEN r.amount
+				  WHEN  st.earned_points - COALESCE(SUM(r2.amount), 0)  > 0 AND st.earned_points - COALESCE(SUM(r2.amount), 0)  <= r.amount  THEN  st.earned_points - COALESCE(SUM(r2.amount), 0)
+				  ELSE 0 END AS earned_points
+			FROM  receipt r
+			LEFT JOIN  spending_transaction st ON  st.spending_transaction_id = r.spending_transaction_id
+            LEFT JOIN  receipt              r2 ON  r2.spending_transaction_id = r.spending_transaction_id  AND  r2.receipt_id < r.receipt_id
+			GROUP BY r.receipt_id ,r.spending_transaction_id  ,st.earned_points  ,r.amount
+""")
+
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+earned_point.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+job.commit()
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+"""
+## Transformation Step 1: Earned Points
+earned_point = spark.sql(
+			SELECT
+			 r.receipt_id as mapping_receipt_id,
+			 r.spending_transaction_id as  spending_transaction_id2,
+             CASE WHEN  st.earned_points - COALESCE(SUM(r2.amount), 0)  > r.amount  THEN r.amount
+				  WHEN  st.earned_points - COALESCE(SUM(r2.amount), 0)  > 0 AND st.earned_points - COALESCE(SUM(r2.amount), 0)  <= r.amount  THEN  st.earned_points - COALESCE(SUM(r2.amount), 0)
+				  ELSE 0 END AS earned_points
+			FROM  receipt r
+			LEFT JOIN  spending_transaction st ON  st.spending_transaction_id = r.spending_transaction_id
+            LEFT JOIN  receipt              r2 ON  r2.spending_transaction_id = r.spending_transaction_id  AND  r2.receipt_id < r.receipt_id
+			GROUP BY r.receipt_id ,r.spending_transaction_id  ,st.earned_points  ,r.amount
+)
+print("Tranformation: Earned Point Adjusted")
+
+"""
+
+"""
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+print("Perform data transformation...")
+
+windowPartition = Window.partitionBy("spending_transaction_id").orderBy("receipt_id")
+
+receipt2 = receipt_df.select('receipt_id', 'amount', 'spending_transaction_id')\
+                  .withColumn('accumulated_amount', sum(col('amount')).over(windowPartition))
+receipt2.createOrReplaceTempView("receipt2")
+
+earned_point = spark.sql(Select 
+    t1.receipt_id,
+    t1.spending_transaction_id,
+    case when t2.earned_points > t1.accumulated_amount then t1.accumulated_amount
+         when t2.earned_points - t1.accumulated_amount > 0 then t2.earned_points - t1.accumulated_amount
+         else 0 end as earned_points
+from receipt2 t1
+left join spending_transaction t2 on t1.spending_transaction_id = t2.spending_transaction_id
+)
+
+"""
+
+

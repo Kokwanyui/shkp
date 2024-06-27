@@ -1,0 +1,421 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env =='prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db03sub = "tpdt_03sub"
+    output_path="s3://tpdt-dw/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub = "tpdt_03sub_"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+prefix="shkpmalls_vip_"
+prefix03="tpdt_"
+
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : gift_category
+t_gift_category = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'gift_category', transformation_ctx = "gift_category")
+gift_category_df = t_gift_category.toDF()
+gift_category_df.createOrReplaceTempView("gift_category")
+print("Source Extraxtion Finished: gift_category...")
+
+##source table : gift_redemption_transaction
+t_gift_redemption_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'gift_redemption_transaction', transformation_ctx = "gift_redemption_transaction")
+gift_redemption_transaction_df = t_gift_redemption_transaction.toDF()
+gift_redemption_transaction_df.createOrReplaceTempView("gift_redemption_transaction")
+print("Source Extraxtion Finished: gift_redemption_transaction...")
+
+##source table : coupon_redemption_transaction
+t_coupon_redemption_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'coupon_redemption_transaction', transformation_ctx = "coupon_redemption_transaction")
+coupon_redemption_transaction_df = t_coupon_redemption_transaction.toDF()
+coupon_redemption_transaction_df.createOrReplaceTempView("coupon_redemption_transaction")
+print("Source Extraxtion Finished: coupon_redemption_transaction...")
+
+##source table : coupon_category
+t_coupon_category = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'coupon_category', transformation_ctx = "coupon_category")
+coupon_category_df = t_coupon_category.toDF()
+coupon_category_df.createOrReplaceTempView("coupon_category")
+print("Source Extraxtion Finished: coupon_category...")
+
+##source table : gift_content
+t_gift_content = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_gift_content', transformation_ctx = "staging_gift_content")
+gift_content_df = t_gift_content.toDF()
+gift_content_df.createOrReplaceTempView("gift_content")
+print("Source Extraxtion Finished: gift_content...")
+
+##cource table : coupon_content
+t_coupon_content = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_coupon_content', transformation_ctx = "staging_coupon_content")
+coupon_content_df = t_coupon_content.toDF()
+coupon_content_df.createOrReplaceTempView("coupon_content")
+print("Source Extraxtion Finished: coupon_content...")
+
+## mapping table : dim_tp_mall_mapping.csv
+mall_mapping_df = spark.read.csv(dimension_path + 'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv', header='true', inferSchema='true', sep=',')
+mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+print("Source Extraxtion Finished: dim_tp_mall_mapping.csv...")
+
+##source table : staging_condition_detail
+t_staging_condition_detail = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_condition_detail', transformation_ctx = "staging_condition_detail")
+staging_condition_detail_df = t_staging_condition_detail.toDF()
+staging_condition_detail_df.createOrReplaceTempView("staging_condition_detail")
+print("Source Extraxtion Finished: condition_detail...")
+
+##source table : inventory
+t_inventory = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'inventory', transformation_ctx = "inventory")
+inventory_df = t_inventory.toDF()
+inventory_df.createOrReplaceTempView("inventory")
+print("Source Extraxtion Finished: inventory...")
+
+##mapping table : point_or_cash_brand_list
+t_point_or_cash_brand_list= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_point_or_cash_brand_list', transformation_ctx = "staging_point_or_cash_brand_list")
+point_or_cash_brand_list_df = t_point_or_cash_brand_list.toDF()
+point_or_cash_brand_list_df.createOrReplaceTempView("point_or_cash_brand_list")
+print("Source Extraxtion Finished: point_or_cash_brand_list...")
+
+##mapping table : point_or_cash_tiers
+t_point_or_cash_tiers= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_point_or_cash_tiers', transformation_ctx = "staging_point_or_cash_tiers")
+point_or_cash_tiers_df = t_point_or_cash_tiers.toDF()
+point_or_cash_tiers_df.createOrReplaceTempView("point_or_cash_tiers")
+print("Source Extraxtion Finished: point_or_cash_tiers...")
+
+##mapping table : coupon_redeem
+t_coupon_redeem= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_coupon_redeem', transformation_ctx = "staging_coupon_redeem")
+coupon_redeem_df = t_coupon_redeem.toDF()
+coupon_redeem_df.createOrReplaceTempView("coupon_redeem")
+print("Source Extraxtion Finished: coupon_redeem...")
+
+##mapping table : gift
+t_gift = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'gift', transformation_ctx = "gift")
+gift_df = t_gift.toDF()
+gift_df.createOrReplaceTempView("gift")
+print("Source Extraxtion Finished: gift...")
+
+##mapping table : coupon
+t_coupon = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'coupon', transformation_ctx = "coupon")
+coupon_df = t_coupon.toDF()
+coupon_df.createOrReplaceTempView("coupon")
+print("Source Extraxtion Finished: coupon...")
+
+##mapping table : condition
+t_condition = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'condition', transformation_ctx = "condition")
+condition_df = t_condition.toDF()
+condition_df.createOrReplaceTempView("condition")
+print("Source Extraxtion Finished: condition...")
+
+##mapping table : gift_map_to_new_gift_cat
+gift_map_to_new_gift_cat_df = spark.read.csv(dimension_path + 'tpdt_dim_gift_map_to_new_gift_cat/tpdt_dim_gift_map_to_new_gift_cat.csv', header='true', inferSchema='true', sep=',').select(col('gift_id').alias('mapping_gift_id'),'new_gift_type','new_sub_gift_type')
+gift_map_to_new_gift_cat_df.createOrReplaceTempView("gift_map_to_new_gift_cat")
+print("Source Extraxtion Finished: gift_map_to_new_gift_cat...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Tranformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Transformation 1: Gift Part
+tmp_gift_type_aggregate = spark.sql("""
+		SELECT gift_category_id as mapping_gift_category_id, name_lang1 as gift_type
+		FROM  gift_category where parent_id is null  or parent_id = gift_category_id
+
+        union all
+
+		select t2.gift_category_id , t1.name_lang1
+		From  gift_category t1 right join
+		(
+			SELECT * FROM  gift_category
+			where parent_id is not null and parent_id != gift_category_id ) t2  on t1.gift_category_id=t2.parent_id
+		where t1.parent_id is null
+""")
+tmp_gift_type_aggregate.createOrReplaceTempView("tmp_gift_type_aggregate")
+
+# Transformation 2: Coupon Part
+tmp_coupon_type_aggregate = spark.sql("""
+		SELECT coupon_category_id as mapping_coupon_category_id, name_lang1  as gift_type
+		FROM  coupon_category where parent_id is null  or parent_id = coupon_category_id
+
+        union all
+
+		select t2.coupon_category_id , t1.name_lang1
+		From  coupon_category t1 right join
+		(
+			SELECT * FROM  coupon_category
+			where parent_id is not null and parent_id != coupon_category_id ) t2  on t1.coupon_category_id=t2.parent_id
+		where t1.parent_id is null
+""")
+tmp_coupon_type_aggregate.createOrReplaceTempView("tmp_coupon_type_aggregate")
+
+tmp_1 = spark.sql("""
+		select	 gift_id,	mall_id,
+		count(distinct gift_redemption_transaction_id) as redeemed_qty,
+		count(distinct case when status = 'R' then gift_redemption_transaction_id else NULL end) as collected_or_used_qty ,
+        count( case when date_format(redeem_datetime ,'yyyy-MM-dd') > last_day(current_date - INTERVAL 1 MONTHS  )    then  gift_redemption_transaction_id else null end) as mtd_redeemed_qty
+		from		gift_redemption_transaction as grt
+		where		grt.status not in ('C', 'L')
+		group by	gift_id, mall_id
+""")
+tmp_1.createOrReplaceTempView("tmp_1")
+
+tmp_2 = spark.sql("""
+		select		coupon_id, mall_id,
+		count(distinct coupon_redemption_transaction_id) as redeemed_qty,
+		count(distinct case when status = 'U' then coupon_redemption_transaction_id else NULL end) as collected_or_used_qty,
+        count( case when date_format(redeem_datetime ,'yyyy-MM-dd') > last_day(current_date - INTERVAL 1 MONTHS  )    then  coupon_redemption_transaction_id else null end) as mtd_redeemed_qty
+		from		coupon_redemption_transaction as crt
+		where		crt.status not in ('C', 'L')
+		group by	coupon_id, mall_id
+""")
+tmp_2.createOrReplaceTempView("tmp_2")
+
+temp3 = spark.sql("""
+		select		t1.gift_id,
+					t6.team,
+					t6.property_id,
+					case 	when extra_function = 'C' then 'Free Parking'
+							else 'Mall Gift (CCC)' end as item_type,
+					t1.status			as gift_status,
+					case	when t1.status = 'A' then 'Active'
+							when t1.status = 'I' then 'Inactive'
+							when t1.status = 'V' then 'Invalid'
+							else NULL end as gift_status_detail,
+					t1.created_date		as created_datetime,
+					date_format(t1.created_date,'yyyyMM')		as created_datetime_yearmonth,
+					t1.name_lang1		as name_en,
+					t1.name_lang2		as name_tc,
+					t1.name_lang3		as name_sc,
+					t9.gift_type,
+                    t2.name_lang1		as sub_gift_type,
+					-- smallint(is_common)			as common_gift,
+					-- smallint(is_hotpick)			as hotpick_gift,
+					value_amount	as gift_unit_cost,
+					case    when t3.start_date = '' then t3.start_date else date_format(t3.start_date,'yyyy-MM-dd') end as redemption_date_start ,
+                    case    when t3.end_date   = '' then t3.end_date   else date_format(t3.end_date  ,'yyyy-MM-dd') end as redemption_date_end   ,
+
+					 ''  as redemption_weekday,
+					case	when t1.type = 'S' then 'Redeem by receipt'
+							when t1.type = 'B' and 	t1.bonus_point_1=0 then 'Redeem by 0 point'
+							when t1.type = 'B' then 'Redeem by bonus point'
+							when t1.type = 'N' then 'point + cash type' else NULL end as `redeem_type`,
+                    t1.bonus_point_1 as required_redeem_bonus_point,
+					case 	when t1.extra_function = 'C' then  t1.car_park_min_spending_amount
+							else t3.min_matched_receipt_total_amount  end as required_redeem_spending ,
+					t3.frequency_type   as redemption_limit_type,
+					t3.value  as redemption_limit_qty,
+					date_format(t1.reserve_expiry_date,'yyyy-MM-dd') as reserve_expiry_date,
+					t1.reserve_expiry_day,
+					case	when unlimited_inventory = 0 then 'Limited Inventory'
+							when unlimited_inventory = 1 then 'Unlimited Inventory'
+							else NULL end as inventory_type,
+					t5.property_id as stock_at_property_id,
+					coalesce(t4.original_stock_level,0) as original_stock_level,
+					coalesce(t4.stock_level,0) as physical_stock_level,
+					coalesce(t8.redeemed_qty,0) as redeemed_stock_level,
+					coalesce(collected_or_used_qty,0) as collected_or_used_stock_level,
+					coalesce(t4.original_stock_level,0) - coalesce(t8.redeemed_qty,0) as stock_level_available_for_redemption,
+                    coalesce(t8.mtd_redeemed_qty,0) as mtd_redeemed_stock_level
+
+    	from		gift_content                        t1
+		left join	gift_category                       t2		    on t2.gift_category_id = t1.gift_category_id
+        left join   tmp_gift_type_aggregate             t9          on t9.mapping_gift_category_id = t1.gift_category_id
+		left join	staging_condition_detail            t3		    on t3.parent_id = t1.gift_id
+		left join	inventory                           t4			on t4.parent_id = t1.gift_id
+		left join	dim_tp_mall_mapping                 t5			on t4.mall_id = t5.mall_id
+		inner join	dim_tp_mall_mapping                 t6			on t6.mall_id = t1.mall_id
+		left join	tmp_1                               t8			on t8.gift_id = t1.gift_id and  t8.mall_id = t5.mall_id
+
+        UNION ALL
+
+        select		t1.coupon_id			as gift_id,
+					t5.team,
+					t5.property_id,
+					case 	when t1.name_lang1 like '%SHKP Mall e-Gift Certificate%' then 'SHKP Mall e-Gift Certificate'
+							else 'Shop Gift' end as item_type,
+					t1.status			as gift_status,
+					case	when t1.status = 'A' then 'Active'
+							when t1.status = 'I' then 'Inactive'
+							when t1.status = 'V' then 'Invalid'
+							else NULL end as gift_status_detail,
+					t1.created_date		as created_datetime,
+					date_format(t1.created_date,'yyyyMM')		as created_datetime_yearmonth,
+					t1.name_lang1		as name_en,
+					t1.name_lang2		as name_tc,
+					t1.name_lang3		as name_sc,
+					t10.gift_type,
+                    t2.name_lang1		as sub_gift_type,
+					-- smallint(is_common)			as common_gift,
+					-- smallint(is_hotpick)		as hotpick_gift,
+					value_amount	as gift_unit_cost,
+                    case    when t8.start_date = '' then t8.start_date else date_format(t8.start_date,'yyyy-MM-dd') end as redemption_date_start ,
+                    case    when t8.end_date   = '' then t8.end_date   else date_format(t8.end_date  ,'yyyy-MM-dd') end as redemption_date_end   ,
+
+
+					''  as redemption_weekday,
+					case	when t1.type = 'S' then 'Redeem by receipt'
+							when t1.type = 'B' and  t9.bonus_point > 0 then 'Redeem by 0 point'
+							when t1.type = 'B' then 'Redeem by bonus point'
+                            when t1.type = 'N' then 'point + cash type'
+					else NULL end as `redeem_type`,
+					trim(replace(t9.bonus_point,',','')) as required_redeem_bonus_point,
+					t8.min_matched_receipt_total_amount  as required_redeem_spending,
+					t8.frequency_type  as redemption_limit_type,
+					t8.value as redemption_limit_qty,
+					date_format(t1.usage_expiry_date,'yyyy-MM-dd') as reserve_expiry_date,
+					t1.usage_expiry_day,
+					case	when unlimited_inventory = 0 then 'Limited Inventory'
+							when unlimited_inventory = 1 then 'Unlimited Inventory'
+							else NULL end as inventory_type,
+					t4.property_id as stock_at_property_id,
+					coalesce(t3.original_stock_level,0) as original_stock_level,
+					coalesce(t3.stock_level,0) as physical_stock_level,
+					coalesce(t7.redeemed_qty,0) as redeemed_stock_level,
+					coalesce(collected_or_used_qty,0) as collected_or_used_stock_level,
+					coalesce(t3.original_stock_level,0) - coalesce(t7.redeemed_qty,0) as stock_level_available_for_redemption ,
+					coalesce(t7.mtd_redeemed_qty,0) as mtd_redeemed_stock_level
+		from		coupon_content                      t1
+		left join	coupon_category   	                t2			on t2.coupon_category_id = t1.coupon_category_id
+        left join   tmp_coupon_type_aggregate           t10         on t10.mapping_coupon_category_id = t1.coupon_category_id
+		left join	staging_condition_detail            t8		    on t8.parent_id = t1.coupon_id
+		left join	inventory                           t3			on t3.parent_id = t1.coupon_id
+		left join	dim_tp_mall_mapping                 t4			on t3.mall_id = t4.mall_id
+		inner join	dim_tp_mall_mapping                 t5			on t5.mall_id = t1.mall_id
+		left join	tmp_2	             			    t7			on t7.coupon_id = t1.coupon_id and  t7.mall_id = t4.mall_id
+		left join   coupon_redeem                       t9          on t1.coupon_id = t9.coupon_id
+""")
+temp3.createOrReplaceTempView("temp3")
+
+tmp_brand = spark.sql("""
+        select distinct t1.gift_id,
+                        t1.reward_brand_id,
+                        t2.brand_name as  reward_brand_name ,
+                        redeem_method_combination
+		from point_or_cash_tiers t1
+		left join point_or_cash_brand_list t2 on t1.reward_brand_id=t2.brand_id
+""")
+tmp_brand.createOrReplaceTempView("tmp_brand")
+
+tmp_show_in_api = spark.sql("""
+		select distinct gift_id ,show_in_api ,stamp from gift
+		union all
+		select distinct coupon_id  as gift_id,show_in_api ,stamp from coupon
+""")
+tmp_show_in_api.createOrReplaceTempView("tmp_show_in_api")
+
+tmp_selected_member = spark.sql("""
+		select   parent_id as gift_id
+		from    condition
+		where condition_type=132
+""")
+tmp_selected_member.createOrReplaceTempView("tmp_selected_member")
+
+dw_gift_inventory = spark.sql("""
+        select
+                distinct  t1.gift_id,
+                t1.team,
+                t1.property_id,
+                t1.item_type,
+                t1.gift_status,
+                t1.gift_status_detail,
+                t1.created_datetime,
+                t1.created_datetime_yearmonth,
+                t1.name_en,
+                t1.name_tc,
+                t1.name_sc,
+			    case when t5.new_gift_type is not null then
+			        case when lower(trim(t5.new_gift_type)) in ('null','') then null else trim(t5.new_gift_type) end
+			    else
+			        case when lower( trim(t1.gift_type)) in ('null','') then null else trim(t1.gift_type) end
+			    end as gift_type,
+			    case when t5.new_sub_gift_type is not null then
+			        case when lower(trim(t5.new_sub_gift_type)) in ('null','') then null else trim(t5.new_sub_gift_type) end
+			    else
+			        case when lower(trim(t1.sub_gift_type)) in ('null','') then null else trim(t1.sub_gift_type) end
+			    end as sub_gift_type,
+                -- t1.commom_gift,
+                -- t1.hotpick_gift,
+                t1.gift_unit_cost,
+
+                case when year(t1.redemption_date_start) < 2019 then null
+                else cast(t1.redemption_date_start as date) end as redemption_date_start,
+
+                case when year(t1.redemption_date_end) < 2019 then null
+                else cast(t1.redemption_date_end as date)  end as redemption_date_end,
+
+                t1.redeem_type,
+                cast(t1.required_redeem_bonus_point as double) as required_redeem_bonus_point,
+                cast(t1.required_redeem_spending as int) as required_redeem_spending,
+                t1.redemption_limit_type,
+                t1.redemption_limit_qty,
+
+                case when year(t1.reserve_expiry_date) < 2019 then null
+                else cast(t1.reserve_expiry_date as date) end as reserve_expiry_date,
+                t1.reserve_expiry_day,
+                t1.inventory_type,
+                t1.stock_at_property_id, 
+                t1.original_stock_level,
+                t1.physical_stock_level,
+                t1.redeemed_stock_level,
+                t1.collected_or_used_stock_level,
+                t1.stock_level_available_for_redemption, 
+                t1.mtd_redeemed_stock_level,
+                t2.show_in_api,
+                t2.stamp,
+                t3.reward_brand_id,
+                t3.reward_brand_name,
+                t3.redeem_method_combination,
+                case when t4.gift_id is null then 0 else 1 end as selected_member
+        from  temp3                         t1 
+        left join tmp_show_in_api           t2 on t1.gift_id=t2.gift_id  
+		left join tmp_brand                 t3 on t1.gift_id=t3.gift_id 
+        left join tmp_selected_member       t4 on t1.gift_id=t4.gift_id
+        left join gift_map_to_new_gift_cat  t5 on t5.mapping_gift_id = t1.gift_id
+""")
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+dw_gift_inventory.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+

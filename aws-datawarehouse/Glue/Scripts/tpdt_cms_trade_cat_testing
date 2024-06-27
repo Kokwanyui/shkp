@@ -1,0 +1,107 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_cms_"
+prefix03='tpdt_'
+dimension_prefix = "bi_dimension_"
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : shop
+t_shop = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'shop', transformation_ctx = "shop")
+shop_df = t_shop.toDF()
+shop_df.createOrReplaceTempView("shop")
+print("Source Extraxtion Finished: shop...")
+
+
+##source table : shop_cat
+t_shop_cat = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'shop_cat', transformation_ctx = "shop_cat")
+shop_cat_df = t_shop_cat.toDF()
+shop_cat_df.createOrReplaceTempView("shop_cat")
+print("Source Extraxtion Finished: shop_cat...")
+
+
+##source table : rfm_cat
+t_rfm_cat = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_cms_trade_cat_for_rfm', transformation_ctx = "rfm_cat")
+rfm_cat_df = t_rfm_cat.toDF()
+rfm_cat_df.createOrReplaceTempView("rfm_cat")
+print("Source Extraxtion Finished: rfm_cat...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Transformation 1: Find shop trade cat shown in app
+
+cms_shop_cat = spark.sql("""
+SELECT 
+    t1.ID as cms_shop_id, 
+    t1.SHOP_NAME_EN as cms_shop_name,
+    t1.mall_id, 
+    t1.DISPLAY_MAIN_CAT as app_display_cat_id, 
+    t2.CATEGORY_NAME_EN as app_display_cat_name
+FROM shop t1
+left join shop_cat t2 on t1.DISPLAY_MAIN_CAT = t2.ID
+where t1.status = 1
+""")
+
+# Transformation 2: Join CMS tradw cat with rfm cat (defined by CRM Team)
+cms_shop_cat_for_rfm = cms_shop_cat.join(rfm_cat_df, cms_shop_cat.app_display_cat_name == rfm_cat_df.cms_trade_cat, how="left")\
+                                   .select('cms_shop_id', 'cms_shop_name', 'mall_id', 'app_display_cat_id', 'app_display_cat_name', 'rfm_trade_cat')
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+output_path=f"{staging_path}tpdt_cms_trade_cat_for_rfm/"
+cms_shop_cat_for_rfm.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+
+

@@ -1,0 +1,649 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Stack to deploy resources and tasks for member, mall, partner and shop
+
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  DBprefix:
+    Type: String
+    Default: tp03
+  GlueIamRole:
+    Type: String
+  GlueVersion:
+    Type: String
+  GlueDBdw:
+    Type: String
+  GlueDB01replica:
+    Type: String
+  S3ArtifactBucket:
+    Type: String
+  GluejobNumberOfWorkers:
+    Type: Number
+    Description: number of workers for Glue Job
+  S3NameGlueTemporary:
+    Type: String
+  GlueConnector01replica:
+    Type: String
+  CrawlerS3staging:
+    Type: String
+  lambdaIamRole:
+    Type: String
+  accountid:
+    Type: String
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+
+
+Resources:
+# Creating Glue Jobs - Start
+  # Member related jobs - Start
+  dwMember:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_member"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_member'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  odsMemberActivityHistory:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_member_activity_history"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_member_activity_history'
+      NumberOfWorkers: 2
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  odsPartnerMemberMapping:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_partner_member_mapping"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_partner_member_mapping'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  odsDeviceInfo:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_device_info"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_device_info'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  dwSSOMapping:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_sso_mapping"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_sso_mapping'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  dwMemberRegistration:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_member_registration"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_member_registration'
+      NumberOfWorkers: 4
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+  # Member related jobs - End
+
+  # Shop related jobs - Start
+  dwShop:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_shop"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_shop'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: shop
+  # Shop related jobs - End        
+# Creating Glue Jobs - End
+
+
+# Creating Glue Workflow - Start
+  # Member and Shop Related Workflow - Start
+  CustomersGlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - customers
+          - turncate
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member and shop
+  # Member and Shop Related Workflow - End
+# Creating Glue Workflow - End
+
+
+# Creating Glue Trigger - Start
+  # Member and Shop Related Trigger - Start
+  CustomersGlueTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref odsMemberActivityHistory
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - customers
+          - turncate
+          - schedule
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "SCHEDULED"
+      Schedule: cron(05 17 * * ? *)
+      StartOnCreation: true
+      WorkflowName: !Ref CustomersGlueWorkflow
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  odsPartnerMemberMappingTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref odsPartnerMemberMapping
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - odsPartnerMemberMapping
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref CustomersGlueWorkflow
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsMemberActivityHistory
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  odsDeviceInfoTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref odsDeviceInfo
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - odsDeviceInfo
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref CustomersGlueWorkflow
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsPartnerMemberMapping
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  dwShopTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref dwShop
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - dwShop
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref CustomersGlueWorkflow
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsDeviceInfo
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: shop
+
+  dwSSOMappingTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref dwSSOMapping
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - dwSSOMapping
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref CustomersGlueWorkflow
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwShop
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: shop
+
+  dwMemberRegistrationTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref dwMemberRegistration
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - dwMemberRegistration
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref CustomersGlueWorkflow
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwSSOMapping
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  dwMemberTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - dwmember
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      Description: "Trigger dwMember"
+      WorkflowName: !Ref CustomersGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref dwMember
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwMemberRegistration
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+        BusinessFunction: member
+
+  StagingCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - staging
+          - crawler
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      Description: "Trigger staging crawler"
+      WorkflowName: !Ref CustomersGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - CrawlerName: !Ref CrawlerS3staging
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwMember
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: customers
+  # Member and Shop Related Trigger - End
+# Creating Glue Trigger- End
+
+# Creating Lambda Function - Start
+  decryptionMysql:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: decryption info to db02
+      FunctionName: !Sub '${AWSTeam}-decryption-mysql'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/decryption_mysql.zip
+      Timeout: 300
+      Environment:
+        Variables:
+          environment: !Ref AWSEnv
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-09008dc3534447e51
+        SubnetIds:
+          - subnet-0406aa5bbf9d46605
+          - subnet-0768b1e8f3bd1a45b
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: customer
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_SQLAlchemy:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pymysql:1'
+
+  decryptionS3:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: save decrypted info to s3
+      FunctionName: !Sub '${AWSTeam}-decryption-s3'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/decryption_s3.zip
+      Timeout: 900
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          environment: !Ref AWSEnv
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-09008dc3534447e51
+        SubnetIds:
+          - subnet-0406aa5bbf9d46605
+          - subnet-0768b1e8f3bd1a45b
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: customer
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_SQLAlchemy:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pymysql:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_Crypto:1'
+# Creating Lambda Function - End

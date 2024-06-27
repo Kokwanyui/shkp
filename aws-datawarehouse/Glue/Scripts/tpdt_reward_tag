@@ -1,0 +1,80 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import date
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-staging/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-staging-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+datamart_prefix = "bi_datamart_"
+dimension_prefix = "bi_dimension_"
+
+##source table : mapping_reward_tag
+t_mapping_reward_tag = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'mapping_reward_tag', transformation_ctx = "mapping_reward_tag")
+mapping_reward_tag_df = t_mapping_reward_tag.toDF()
+mapping_reward_tag_df.createOrReplaceTempView("mapping_reward_tag")
+
+##source table : tag
+t_tag = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'tag', transformation_ctx = "tag")
+tag_df = t_tag.toDF()
+tag_df.createOrReplaceTempView("tag")
+
+df = spark.sql("""
+Select t1.*, t2.name_lang1
+, t2.name_lang2
+, t2.name_lang3
+from mapping_reward_tag t1
+left join tag t2
+on t1.tag_id = t2.tag_id
+""")
+
+
+df_path="s3://tpdt-staging/tpdt_reward_tag/"
+df.write.format('parquet').mode('overwrite').option("header",True).save(df_path)
+
+
+

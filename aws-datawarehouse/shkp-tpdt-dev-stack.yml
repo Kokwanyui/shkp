@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Parent stack to delpoy whole dev environment
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    Default: dev
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  GlueIamRole:
+    Type: String
+    Default: arn:aws:iam::214369837568:role/analytic-etl-glue-globalstack
+  GlueVersion:
+    Type: String
+    Default: 3.0
+  GluejobNumberOfWorkers:
+    Type: Number
+    Description: number of workers for Glue Job
+    Default: 2
+  GlueSecurityGroupID:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-0c718d9f37ddc0b9f
+  SecretManagerNameDB01:
+    Type: String
+    Default: tpanalytic-dev-db01uat
+  SubnetID:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-05647260b2f401c84
+  lambdaIamRole:
+    Type: String
+    Default: arn:aws:iam::214369837568:role/tpdt-lambda-dev
+  accountid:
+    Type: String
+    Default: '214369837568'
+
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+
+Resources:
+# Nested Stacks - Start
+  Architecture:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-architecture-stack.yml'
+      Parameters:
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueSecurityGroupID: !Ref GlueSecurityGroupID
+        SecretManagerNameDB01: !Ref SecretManagerNameDB01
+        SubnetID: !Ref SubnetID
+
+
+  Staging:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-staging-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueDB01replica: !GetAtt Architecture.Outputs.GlueDB01replica
+        GlueConnector01replica: !GetAtt Architecture.Outputs.GlueConnector01replica
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+
+  Customers:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-customers-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueDB01replica: !GetAtt Architecture.Outputs.GlueDB01replica
+        GlueConnector01replica: !GetAtt Architecture.Outputs.GlueConnector01replica
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+        CrawlerS3staging: !GetAtt Architecture.Outputs.CrawlerS3staging
+
+  Transactions:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-transactions-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueDB01replica: !GetAtt Architecture.Outputs.GlueDB01replica
+        GlueConnector01replica: !GetAtt Architecture.Outputs.GlueConnector01replica
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+        CrawlerS3dw: !GetAtt Architecture.Outputs.CrawlerS3dw
+
+  lms:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-lms-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueDB01replica: !GetAtt Architecture.Outputs.GlueDB01replica
+        GlueConnector01replica: !GetAtt Architecture.Outputs.GlueConnector01replica
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+
+  parking:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-parking-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueDB01replica: !GetAtt Architecture.Outputs.GlueDB01replica
+        GlueConnector01replica: !GetAtt Architecture.Outputs.GlueConnector01replica
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+
+  stampmission:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-stampmission-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueDB01replica: !GetAtt Architecture.Outputs.GlueDB01replica
+        GlueConnector01replica: !GetAtt Architecture.Outputs.GlueConnector01replica
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+
+  foodordering:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-foodorder-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueDB01replica: !GetAtt Architecture.Outputs.GlueDB01replica
+        GlueConnector01replica: !GetAtt Architecture.Outputs.GlueConnector01replica
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+
+  ga:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWSTeam}-artifacts-${AWSEnv}.s3.ap-east-1.amazonaws.com/Stacks/${AWSTeam}-ga-stack.yml'
+      Parameters:
+        AWSTeam: !Ref AWSTeam
+        AWSEnv: !Ref AWSEnv
+        GlueIamRole: !Ref GlueIamRole
+        GlueVersion: !Ref GlueVersion
+        GlueDBdw: !GetAtt Architecture.Outputs.GlueDBdw
+        GlueConnector03redshift: !GetAtt Architecture.Outputs.GlueConnector03redshift
+        S3ArtifactBucket: !Sub '${AWSTeam}-artifacts-${AWSEnv}'
+        GluejobNumberOfWorkers: !Ref GluejobNumberOfWorkers
+        S3NameGlueTemporary: !GetAtt Architecture.Outputs.S3NameGlueTemporary
+        lambdaIamRole: !Ref lambdaIamRole
+        accountid: !Ref accountid
+
+# Nested Stacks - End
+
+# Custom Resources on Env - Start
+  # shkpmalls_wechat_analytics crawler - Start
+  CrawlerJDBCshkpmallsWechat:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - db01
+          - shkpmalls
+          - wechat
+          - analytics
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl shkpmalls_wechat_analytics data in db02
+      DatabaseName: !GetAtt Architecture.Outputs.GlueDB01replica
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !GetAtt Architecture.Outputs.GlueConnector01replica
+            Path: shkpmalls_wechat_analytics/%
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: architecture
+  # shkpmalls_wechat_analytics crawler - End
+# Custom Resources on Env - End

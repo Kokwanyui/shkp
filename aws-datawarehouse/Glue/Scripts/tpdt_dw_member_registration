@@ -1,0 +1,633 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+'''spark.conf.set("spark.sql.session.timeZone", "GMT+8")'''
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db03 = "tpdt_03dw"
+    db02 = "tpdt_02replica"
+    output_path = "s3://tpdt-dw/" + table_name + "/"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    output_path = "s3://tpdt-dw-" + env + "/" + table_name + "/"
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+
+prefix = "shkpmalls_vip_"
+wechat_prefix = "shkpmalls_wechat_analytics_"
+push_prefix = "shkpmalls_push_"
+www_prefix = "thepoint_www_"
+prefix03 = "tpdt_"
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : member_activity_history
+t_member_activity_history = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                          table_name=prefix + 'member_activity_history',
+                                                                          transformation_ctx="member_activity_history")
+member_activity_history_df = t_member_activity_history.toDF()
+member_activity_history_df.createOrReplaceTempView("member_activity_history")
+print("Source Extraction Finished: member_activity_history...")
+
+##source table : api_key
+t_api_key = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'api_key',
+                                                          transformation_ctx="api_key")
+api_key_df = t_api_key.toDF()
+api_key_df.createOrReplaceTempView("api_key")
+print("Source Extraxtion Finished: api_key...")
+
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'member',
+                                                         transformation_ctx="member")
+member_df = t_member.toDF()
+member_df.createOrReplaceTempView("member")
+print("Source Extraxtion Finished: member...")
+
+##source table : dt_tracking_user_log
+if env == 'dev':
+    t_dt_tracking_user_log = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                           table_name=wechat_prefix + 'dt_tracking_user_log',
+                                                                           transformation_ctx="dt_tracking_user_log")
+    dt_tracking_user_log_df = t_dt_tracking_user_log.toDF()
+elif env == 'uat':
+    t_dt_tracking_user_log = spark.read.csv(dimension_path + 'tpdt-dimension-dev/tpdt-dimension-dev.csv', header='true',
+                                            inferSchema='true', sep='|')
+else:
+    t_dt_tracking_user_log = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                                           table_name=wechat_prefix + 'dt_tracking_user_log',
+                                                                           transformation_ctx="dt_tracking_user_log")
+    dt_tracking_user_log_df = t_dt_tracking_user_log.toDF()
+
+dt_tracking_user_log_df.createOrReplaceTempView("dt_tracking_user_log")
+print("Source Extraxtion Finished: dt_tracking_user_log...")
+
+##source table : mobilereceiver
+t_mobilereceiver = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                 table_name=push_prefix + 'mobilereceiver',
+                                                                 transformation_ctx="mobilereceiver")
+mobilereceiver_df = t_mobilereceiver.toDF()
+mobilereceiver_df.createOrReplaceTempView("mobilereceiver")
+print("Source Extraxtion Finished: mobilereceiver...")
+
+## mapping table : dim_from_mall_mapping.csv
+dim_from_mall_hardcode_df = spark.read.csv(
+    dimension_path + 'tpdt_dim_from_mall_hardcode/tpdt_dim_from_mall_hardcode.csv', header='true', inferSchema='true',
+    sep=',')
+dim_from_mall_hardcode_df.createOrReplaceTempView("dim_from_mall_hardcode")
+print("Source Extraxtion Finished: dim_from_mall_hardcode.csv...")
+
+## mapping table : dim_registration_link_hardcore.csv
+dim_registration_link_hardcode_df = spark.read.csv(
+    dimension_path + 'tpdt_dim_registration_link_hardcode/tpdt_dim_registration_link_hardcode.csv', header='true',
+    inferSchema='true', sep=',')
+dim_registration_link_hardcode_df.createOrReplaceTempView("dim_registration_link_hardcode")
+print("Source Extraxtion Finished: dim_registration_link_hardcode.csv...")
+
+##source table : tbl_reg_from_mall
+t_tbl_reg_from_mall = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                    table_name=www_prefix + 'tbl_reg_from_mall',
+                                                                    transformation_ctx="tbl_reg_from_mall")
+tbl_reg_from_mall_df = t_tbl_reg_from_mall.toDF()
+tbl_reg_from_mall_df.createOrReplaceTempView("tbl_reg_from_mall")
+print("Source Extraxtion Finished: tbl_reg_from_mall...")
+
+##source table : user
+t_user = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'user',
+                                                       transformation_ctx="user")
+user_df = t_user.toDF()
+user_df.createOrReplaceTempView("user")
+print("Source Extraxtion Finished: user...")
+
+##source table : tpdt_dim_wechat_mall_mapping
+t_tpdt_dim_wechat_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database='tpdt_03sub',
+                                                                               table_name=prefix03 + 'dim_wechat_mall_mapping',
+                                                                               transformation_ctx="dim_wechat_mall_mapping")
+tpdt_dim_wechat_mall_mapping_df = t_tpdt_dim_wechat_mall_mapping.toDF()
+tpdt_dim_wechat_mall_mapping_df.createOrReplaceTempView("dim_wechat_mall_mapping")
+print("Source Extraxtion Finished: dim_wechat_mall_mapping...")
+
+## mapping table : dim_tp_mall_mapping.csv
+dim_tp_mall_mapping_df = spark.read.csv(dimension_path + 'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv',
+                                        header='true', inferSchema='true', sep=',')
+dim_tp_mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+print("Source Extraxtion Finished: dim_tp_mall_mapping.csv...")
+
+## mapping table : dim_registration_source_mapping.csv
+dim_registration_source_mapping_df = spark.read.csv(
+    dimension_path + 'tpdt_dim_registration_source_mapping/tpdt_dim_registration_source_mapping.csv', header='true',
+    inferSchema='true', sep=',')
+dim_registration_source_mapping_df.createOrReplaceTempView("dim_registration_source_mapping")
+print("Source Extraxtion Finished: dim_registration_source_mapping.csv...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+'''spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.crossJoin.enabled", "true" )'''
+print("Perform data transformation...")
+
+## Transformation Step 1: member channel
+temp_member_channel = spark.sql("""
+    select	  t1.member_id,
+    		      t1.registration_date,
+                t1.created_by,
+                t2.channel,
+                t1.phone_prefix as mobile_prefix,
+                case when  t3.member_id is null then  t1.from_mall_id    else t3.from_mall_id   end as from_mall_id,
+                case when  t3.member_id is null then  t1.from_mall_name  else t3.from_mall_name end as from_mall_name
+
+    from		member as t1
+    left join	(
+    	select		member_id,
+    				case	when coalesce(api.name,'Manual Create') in ('App(DDB)','YataPartner')   then 'Website'
+            				when hist.api_key = '348ae519-f693-4393-bba5-e46238677b1e' 			    then 'Website'
+        					when hist.api_key = '3288c33e-6041-485b-8e69-d93a52cdb0a5' 			    then 'Wechat'
+                            when api.name like '%Wechat%'							 			    then 'Wechat'
+                            when api.name = 'WeChat new key'                                        then 'Wechat'
+    						else coalesce(api.name,'Manual Create') end
+                    as channel
+    	from		member_activity_history as hist
+    	left join	api_key as api						on	api.api_key = hist.api_key
+    	where		action_type = 6
+    ) as t2		on  t2.member_id = t1.member_id
+    left join dim_from_mall_hardcode t3 on t1.member_id = t3.member_id
+""")
+temp_member_channel.createOrReplaceTempView("member_channel")
+
+temp_wechat_tracking_url_updated = spark.sql("""
+select		distinct
+			replace(log.scene,'%3D','=') as scene,
+			log.openid,
+			log.tracking_flag,
+            log.last_track_time,
+            concat(log.openid, date(log.last_track_time)) as `key2`
+from		dt_tracking_user_log as log
+where		log.path IN ('pages/register/register4','pages/register/register_success')
+""")
+temp_wechat_tracking_url_updated.createOrReplaceTempView("wechat_tracking_url_updated")
+print("temp_wechat_tracking_url_updated_done")
+
+temp_recieve_min = spark.sql(
+    """
+    Select vip_num,
+           min(created_date) as min_created_date,
+           concat(vip_num, date_format(min(created_date), 'yyyyMMddhhmmss')) as `key`
+    From mobilereceiver
+    Group by vip_num
+    """
+)
+temp_recieve_min.createOrReplaceTempView("recieve_min")
+
+temp_mobilereceiver = spark.sql(
+    """
+    Select *
+    From mobilereceiver
+    Where vip_num is not null
+    """
+)
+temp_mobilereceiver.createOrReplaceTempView("mobilereceiver")
+
+temp_membermobilereceiver = spark.sql(
+    """
+    select		m.member_id,
+			m.registration_date,
+			receive.*,
+			concat(receive.vip_num, date_format(receive.created_date, 'yyyyMMddhhmmss')) as `key`,
+            concat(receive.openid, date_format(m.registration_date, 'yyyy-MM-dd')) as `key2`
+    from		member as m
+    inner join	mobilereceiver as receive					on	receive.vip_num = m.member_id
+    """
+)
+temp_membermobilereceiver.createOrReplaceTempView("membermobilereceiver")
+
+json_df = temp_wechat_tracking_url_updated.toPandas()
+column = 'scene'
+rows = len(json_df)
+for row in range(rows):
+    try:
+        internal = json.loads(json_df[column][row])
+        for key in internal.keys():
+            if key == 'query':
+                query_value = internal[key]
+                for keys, values in query_value.items():
+                    if keys == 'scene' and 'mgm' not in values.lower():
+                        json_df.loc[row, 'btl'] = values
+                    elif keys == 'oa':
+                        json_df.loc[row, 'oa'] = values
+                    elif keys == 'key':
+                        json_df.loc[row, 'key'] = values
+                    elif keys == 'scene' and 'mgm' in values.lower():
+                        json_df.loc[row, 'mgm'] = values
+                    elif 'mgm' in keys:
+                        json_df.loc[row, 'mgm'] = keys
+                    else:
+                        pass
+            elif key == 'memberId':
+                json_df.loc[row, key] = internal[key]
+            else:
+                pass
+    except:
+        pass
+
+print(json_df.info())
+json_df['btl'] = json_df['btl'].apply(lambda x: str(x).replace('btl-', '').replace('oa=', '').replace('key=', ''))
+json_df['key'] = json_df['key'].apply(lambda x: str(x).replace('key=', ''))
+json_df['oa'] = json_df['oa'].apply(lambda x: str(x).replace('key=', ''))
+json_df = json_df[['key2', 'scene', 'oa', 'btl', 'key', 'mgm', 'memberId', 'last_track_time', 'openid']]
+json_df['memberId'] = json_df['memberId'].astype(str)
+json_df['mgm'] = json_df['mgm'].astype(str)
+
+
+def modify_scene(scene_str):
+    try:
+        scene_obj = json.loads(scene_str)
+        if "phone" in scene_obj:
+            del scene_obj["phone"]
+        return json.dumps(scene_obj)
+    except:
+        pass
+
+
+json_df['scene'] = json_df['scene'].apply(modify_scene)
+
+json_df_result = spark.createDataFrame(json_df)
+json_df_result.createOrReplaceTempView("json_df_result")
+print("json_df_result_done")
+
+tmp_wechat_openid_df = spark.sql("""
+select
+        distinct 
+        key2,
+        scene,
+        oa,
+        btl,
+        key,
+        mgm,
+        memberId,
+        last_track_time,
+        openid
+from (
+    Select *, rank() OVER (PARTITION BY openid, date(last_track_time) ORDER BY last_track_time ASC) as ranking
+    From json_df_result
+    )A
+where ranking = 1
+""")
+tmp_wechat_openid_df.createOrReplaceTempView("wechat_openid_df")
+print("wechat_openid_df_done")
+
+tmp_wechat_openid_df_special_for_ym = spark.sql("""
+Select distinct memberId as member_id, scene, 'YM' as source
+    from (
+    Select *, rank() OVER (PARTITION BY memberId ORDER BY last_track_time ASC) as ranking
+    From json_df_result t1
+    inner join (select member_id, registration_date from member) t2
+    on t1.memberId = t2.member_id and date(t1.last_track_time) = date(t2.registration_date)
+    where openid in ('ov33c4uItlZVfJ_mH93kDuQkYl4I', 'ov33c4qfKt9wdNZRgIlXCzwsLZIM', 'ov33c4i_U1CIzc01IpoKJLVXVOTQ')
+    )A
+where ranking = 1
+""")
+tmp_wechat_openid_df_special_for_ym.createOrReplaceTempView("tmp_wechat_openid_df_special_for_ym")
+print("tmp_wechat_openid_df_special_for_ym_done")
+
+tmp_wechat_memberid_tracking = spark.sql("""
+select 
+        distinct 
+        key2,
+        scene,
+        oa,
+        btl,
+        key,
+        mgm,
+        memberId as member_id,
+        last_track_time,
+        openid
+from (
+    Select *, rank() OVER (PARTITION BY memberId ORDER BY last_track_time, scene ASC) as ranking
+    From json_df_result t1
+    inner join (select member_id, registration_date from member) t2
+    on t1.memberId = t2.member_id and date(t1.last_track_time) = date(t2.registration_date)
+    where COALESCE(oa,'') != 'nan'
+       or COALESCE(btl,'') != 'nan' 
+       or COALESCE(key,'') != 'nan' 
+       or COALESCE(mgm,'') != 'nan'
+    )A
+where ranking = 1    
+""")
+tmp_wechat_memberid_tracking.createOrReplaceTempView("wechat_memberid_tracking")
+print("wechat_memberid_tracking_done")
+
+tmp_wechat_tracking = spark.sql(
+    """
+    Select
+        Distinct m.member_id,
+        m.registration_date,
+        m.openid,
+        track.scene,
+        case when track.oa = 'vw' then 'vwk' else track.oa end as oa,
+        case when track.btl = 'vw' then 'vwk' else track.btl end as btl,
+        case when track.key = 'vw' then 'vwk' else track.key end as key,
+        case when track.mgm = 'vw' then 'vwk' else track.mgm end as mgm
+    From membermobilereceiver m
+    inner join recieve_min on recieve_min.`key` = m.`key`
+    left join wechat_openid_df track on track.`key2` = m.`key2`
+    where m.openid is not null and m.vip_num is not null
+    """
+)
+tmp_wechat_tracking.createOrReplaceTempView("wechat_tracking")
+print("wechat_tracking_done")
+
+website_tracking_version = spark.sql(
+    """
+    Select distinct member_id, max(version) as version from (
+        Select memberid as member_id, url_params, 0 as version
+        from tbl_reg_from_mall
+
+        union all
+
+        Select member_id, url_params, 1 as version
+        from dim_registration_link_hardcode
+        )x
+    group by member_id
+    """
+)
+website_tracking_version.createOrReplaceTempView("website_tracking_version")
+
+temp_website_tracking_raw = spark.sql("""
+
+    select member_id ,  url_params ,
+    substring(utm_source ,   instr(utm_source , '=')+1  , instr(utm_source , '&')- instr(utm_source , '=') -1   ) as utm_source  ,
+    substring(utm_mall   ,   instr(utm_mall , '=')+1    , instr(utm_mall , '&')- instr(utm_mall , '=') -1   ) as utm_mall  ,
+    substring(utm_medium ,   instr(utm_medium , '=')+1  , instr(utm_medium , '&')- instr(utm_medium , '=') -1   ) as utm_medium  ,
+    substring(utm_campaign ,   instr(utm_campaign , '=')+1  , instr(utm_campaign , '&')- instr(utm_campaign , '=') -1   ) as utm_campaign
+    From
+    (
+    	select member_id , url_params ,
+    	case when instr(url_params_fix,'utm_source=') = 0   then null else substring(  url_params_fix ,      instr(url_params_fix,'utm_source=') ,   length(url_params_fix)   ) end as utm_source ,
+    	case when instr(url_params_fix,'utm_mall=') = 0     then null else substring(  url_params_fix ,      instr(url_params_fix,'utm_mall=') ,     length(url_params_fix)   ) end as utm_mall ,
+    	case when instr(url_params_fix,'utm_medium=') = 0   then null else substring(  url_params_fix ,      instr(url_params_fix,'utm_medium=') ,   length(url_params_fix)   ) end as utm_medium ,
+    	case when instr(url_params_fix,'utm_campaign=') = 0 then null else substring(  url_params_fix ,      instr(url_params_fix,'utm_campaign=') , length(url_params_fix)   ) end as utm_campaign
+
+    	from (
+    		select member_id , url_params ,
+    		case when  instr( url_params,'?') =0 then null else  concat(substring( url_params , instr(url_params,'?') , length(url_params) ) ,'&') end as url_params_fix
+    		from (
+
+    		    Select t1.member_id, t1.url_params
+    		    from (
+            		Select memberid as member_id, url_params, 0 as version
+                    from tbl_reg_from_mall
+
+                    union all
+
+                    Select member_id, url_params, 1 as verion
+                    from dim_registration_link_hardcode) t1
+                inner join website_tracking_version t2 on t1.member_id = t2.member_id and t1.version = t2.version
+    		) v
+    	) k
+    ) h
+
+""")
+temp_website_tracking_raw.createOrReplaceTempView("website_tracking")
+
+temp_manual_tracking = spark.sql("""
+select		m.member_id,
+			m.created_by,
+            property_id
+from		member as m
+inner join	member_channel as c		        	on	m.member_id = c.member_id
+inner join	(
+    select mall_id ,login_name ,
+    rank() over(partition by  lower(login_name) order by case when status = 'A' then 1 else 0 end desc, updated_date desc) as rank
+    from user
+) as u	                                    	on	m.created_by = u.login_name
+inner join	dim_tp_mall_mapping as mall		on	mall.mall_id = u.mall_id
+where		c.`channel` = 'Manual Create' and u.rank= 1
+""")
+temp_manual_tracking.createOrReplaceTempView("manual_tracking")
+
+temp_member_channel_final_raw = spark.sql("""
+select		`channel`.member_id,
+			`channel`.registration_date,
+            `channel`.created_by,
+            `channel`.`channel`,
+            `channel`.mobile_prefix,
+            `channel`.from_mall_id,
+            `channel`.from_mall_name,
+            case	when `channel` in ('Website','App(DDB)')			                    then website.url_params
+					when `channel` = 'Wechat' and wechat_new.member_id is not null          then wechat_new.scene
+					when `channel` = 'Wechat' and wechat_ym.member_id is not null          then wechat_ym.scene
+					when `channel` = 'Wechat'                                               then wechat.scene
+					when `channel`.from_mall_id = 5005                                      then 'Registration is made by calling API'
+					when `channel`.from_mall_id = 5004                                      then 'Registration is made by calling API'
+            else NULL end as link ,
+			upper(
+            case when `channel` in ('Website','App(DDB)') then
+                case when website.url_params in (
+												'https://www.thepoint.com.hk/tc/new-registration.html?inapp=true',
+												'https://www.thepoint.com.hk/en/new-registration.html?inapp=true',
+												'https://www.thepoint.com.hk/sc/new-registration.html?inapp=true'
+												) then 'inapp'
+
+                    when (
+						  website.url_params like ('https://www.thepoint.com.hk/tc/campaign/yata/%') or
+						   website.url_params like ('https://www.thepoint.com.hk/sc/campaign/yata/%') or
+						   website.url_params like ('https://www.thepoint.com.hk/en/campaign/yata/%')
+                         ) then 'YATA'
+
+                    when COALESCE(utm_source,'') != '' then utm_source
+                    when COALESCE(utm_mall,'') != '' then utm_mall
+			    else NULL end
+
+
+					when `channel` = 'Wechat' and wechat_new.member_id is not null then
+					    case when COALESCE(wechat_new.oa,'') != 'nan' then wechat_new.oa
+					         when COALESCE(wechat_new.btl,'') != 'nan' then wechat_new.btl
+					         when COALESCE(wechat_new.key,'') != 'nan' then wechat_new.key
+					         when COALESCE(wechat_new.mgm,'') != 'nan' then 'MGM'
+					    else NULL end
+
+					when `channel` = 'Wechat' and wechat_ym.member_id is not null then wechat_ym.source
+
+
+					when `channel` = 'Wechat' then
+					    case when COALESCE(wechat.oa,'') != 'nan' then wechat.oa
+							 when COALESCE(wechat.btl,'') != 'nan' then wechat.btl
+							 when COALESCE(wechat.key,'') != 'nan' then wechat.key
+							 when COALESCE(wechat.mgm,'') != 'nan' then 'MGM'
+					    else NULL end	
+
+                    when `channel` = 'Manual Create'	then manual.property_id
+                    when `channel`.from_mall_id = 5005  then 'KMB'
+                    when `channel`.from_mall_id = 5004  then 'SMARTONE'
+                    else NULL end
+			) as `source`,
+			upper(
+            case	when `channel` in ('Website','App(DDB)')		then utm_medium
+
+                    when (
+						website.url_params like ('https://www.thepoint.com.hk/tc/campaign/yata/%') or
+						website.url_params like ('https://www.thepoint.com.hk/sc/campaign/yata/%') or
+						website.url_params like ('https://www.thepoint.com.hk/en/campaign/yata/%')) then 'YATA App'
+					when `channel`.from_mall_id = 5005  then 'KMB'
+					when `channel`.from_mall_id = 5004  then 'SMARTONE'
+					else NULL end
+			) as `medium`,
+
+            upper(
+            case	when `channel` in ('Website','App(DDB)')		then utm_campaign
+
+                    when (
+						website.url_params like ('https://www.thepoint.com.hk/tc/campaign/yata/%') or
+						website.url_params like ('https://www.thepoint.com.hk/sc/campaign/yata/%') or
+						website.url_params like ('https://www.thepoint.com.hk/en/campaign/yata/%')) then 'YATA / The Point Acquisition'
+					when `channel`.from_mall_id = 5005  then upper(from_mall_name)
+					when `channel`.from_mall_id = 5004  then
+					       case when from_mall_name = 'SmarTone_oneclick'					then 'SMTONECLICK'
+								when from_mall_name = 'SmarTone_forcebundle_retention'		then 'SMT_FORCEBUNDLE_RETENTION'
+								when from_mall_name = 'SmarTone_forcebundle_acquisition'	then 'SMT_FORCEBUNDLE_NEW'
+							else NULL end
+					else NULL end
+			) as `campaign`,
+            '' as allocate_source
+FROM		member_channel 	as `channel`
+left join	website_tracking as website			on	website.member_id = `channel`.member_id
+left join	wechat_memberid_tracking as wechat_new	on	upper(wechat_new.member_id) = upper(`channel`.member_id)
+left join	tmp_wechat_openid_df_special_for_ym as wechat_ym	on	upper(wechat_ym.member_id) = upper(`channel`.member_id)
+left join	wechat_tracking as wechat			on	wechat.member_id = `channel`.member_id
+left join	manual_tracking as manual			on	manual.member_id = `channel`.member_id
+""")
+
+temp_member_channel_final_raw.createOrReplaceTempView("member_channel_final_raw")
+print("member_channel_final_raw_done")
+
+temp_member_channel_final_raw2 = spark.sql("""
+    select  member_id, registration_date, created_by, channel, mobile_prefix, from_mall_id, from_mall_name,
+    case when from_mall_id = 5000 and from_mall_name like '%YATA2_%'   and link is NULL then 'Lost tracking link'
+         when from_mall_id = 5001 and from_mall_name like '%YATAOne_%' and link is NULL then 'Lost tracking link'
+         when from_mall_id = 5004 then 'Registration is made by calling API'
+         when from_mall_id = 5005 then 'Registration is made by calling API'
+    else link end as link,
+
+
+    case when source = 'KPT' then 'KP'
+         when source = 'GENERAL' and   link like '%utm_mall=General%' 	then 'SMARTONE'
+         when source = 'GENERAL' and   medium in ('SMARTONE')			then 'SMARTONE'
+         -- when source = 'GENERAL' and   link not like '%utm_mall=General%' and medium  not in ('SMARTONE') then 'SMARTONE'
+         when source = 'GENERAL' then 'OTHER CHANNEL'
+         when from_mall_id = 5000 and from_mall_name like '%YATA2_%'   and link is NULL then substring(from_mall_name, 7, length(from_mall_name) -6)
+         when from_mall_id = 5001 and from_mall_name like '%YATAOne_%' and link is NULL then substring(from_mall_name, 9, length(from_mall_name) -8)
+         when from_mall_id = 5004 then 'SMARTONE'
+         when from_mall_id = 5005 then 'KMB'
+         when `channel` = 'Wechat' and t2.trackingpath is not null then t2.mall
+         when source is null then 'OTHERS'
+    else source end as source,
+
+
+    case when from_mall_id = 5000 and from_mall_name like '%YATA2_%' and link is NULL then 'QRCODE'
+         when from_mall_id = 5001 and from_mall_name like '%YATAOne_%' and link is NULL and replace(from_mall_name,'YATAOne_','') in ('APPBANNER','ENTRYTICKET','APPPUSH') then 'YATAONLINE'
+         when from_mall_id = 5001 and from_mall_name like '%YATAOne_%' and link is NULL and replace(from_mall_name,'YATAOne_','') in ('YATALED','YATASMS') then 'YATAOFFLINE'
+         when from_mall_id = 5001 and from_mall_name like '%YATAOne_%' and link is NULL and replace(from_mall_name,'YATAOne_','') not in ('YATALED','YATASMS','APPBANNER','ENTRYTICKET','APPPUSH') then 'CANNOT_TRACK'
+         when from_mall_id = 5004 then 'SMARTONE'
+         when from_mall_id = 5005 then 'KMB'
+    else medium end as medium,
+
+
+    case when from_mall_id = 5000 and from_mall_name like '%YATA2_%'   and link is NULL then 'YATACROSS'
+         when from_mall_id = 5001 and from_mall_name like '%YATAOne_%' and link is NULL then 'YATAONECLICK'
+         when from_mall_id = 5004 and from_mall_name = 'SmarTone_oneclick' then 'SMTONECLICK'
+         when from_mall_id = 5004 and from_mall_name = 'SmarTone_forcebundle_retention' then 'SMT_FORCEBUNDLE_RETENTION'
+         when from_mall_id = 5004 and from_mall_name = 'SmarTone_forcebundle_acquisition' then 'SMT_FORCEBUNDLE_NEW'
+         when from_mall_id = 5005 then upper(from_mall_name)
+    else campaign end as campaign,
+
+
+    allocate_source
+    from member_channel_final_raw t1
+    left join dim_wechat_mall_mapping t2 on UPPER(t1.source) = UPPER(t2.trackingpath)
+""")
+temp_member_channel_final_raw2.createOrReplaceTempView('temp_member_channel_final_raw2')
+print("temp_member_channel_final_raw2")
+
+temp_member_channel_final = spark.sql("""
+ Select t1.* ,
+        case when t2.source is not NULL then UPPER(t2.allocate_source) else UPPER(t1.`source`) end as  final_allocate_source
+ from temp_member_channel_final_raw2 t1
+ left join dim_registration_source_mapping t2 on UPPER(t2.source) = UPPER(t1.source)
+ """)
+
+temp_member_channel_final.createOrReplaceTempView('member_channel_final')
+
+## Transformation Step 6: registration_tracking
+registration_tracking = spark.sql("""
+select		member_id,
+            registration_date,
+            created_by,
+            mobile_prefix,
+            from_mall_id,
+            from_mall_name,
+            channel,
+            link,
+            case	when mall.property_id is NULL then 'NON-MALL'
+                    when mall.property_id in ('RMCR') then 'NON-MALL'
+					else 'Mall'
+                    end as Mall_Non_Mall,
+            case	when mall.property_id is NULL then 'NON-MALL'
+                    when mall.property_id in ('RMCR') then 'NON-MALL'
+					else mall.team
+                    end as Team,
+            UPPER(final.source) as source,
+            medium,
+            campaign,
+            case	when lower(mall2.mall_type) = 'mall' then 'MALL'
+					else 'NON-MALL'
+                    end as allocate_Mall_Non_Mall,
+            case	when lower(mall2.mall_type) = 'mall' then mall2.team
+					else 'NON-MALL'
+                    end as allocate_Team,
+            final_allocate_source as     allocate_source
+
+from		member_channel_final as final
+left join	dim_tp_mall_mapping           as mall		on	UPPER(final.source) = UPPER(mall.property_id)
+left join	dim_tp_mall_mapping           as mall2		on	UPPER(final.final_allocate_source) = UPPER(mall2.property_id)
+""")
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+registration_tracking.write.format('parquet').mode('overwrite').partitionBy("from_mall_id").option("header", True).save(
+    output_path)
+print(f"Result Saved in {output_path}...")
+
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+

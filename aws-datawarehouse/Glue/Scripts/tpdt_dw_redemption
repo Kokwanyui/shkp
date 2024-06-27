@@ -1,0 +1,690 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db03 = "tpdt_03dw"
+    db_03sub = "tpdt_03sub"
+    db02 = "tpdt_02replica"
+    output_path = "s3://tpdt-dw/" + table_name + "/"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    db_03sub = "tpdt_03sub_" + env
+    output_path = "s3://tpdt-dw-" + env + "/" + table_name + "/"
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+
+prefix = "shkpmalls_vip_"
+bi_datemart_prefix = 'bi_datamart_'
+prefix03 = 'tpdt_'
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+##source table : staging_ev_charging_redemption
+t_staging_ev_charging_redemption = glueContext.create_dynamic_frame.from_catalog(database = db_03sub, table_name = prefix03+'staging_ev_charging_redemption', transformation_ctx = "staging_ev_charging_redemption")
+staging_ev_charging_redemption_df = t_staging_ev_charging_redemption.toDF().withColumn("created_datetime", to_timestamp("created_datetime", "yyyy-MM-dd HH:mm:ss"))\
+                                                                           .withColumn("updated_date", to_timestamp("updated_date", "yyyy-MM-dd HH:mm:ss"))
+staging_ev_charging_redemption_df.createOrReplaceTempView("ev_charging_redemption")
+print("Source Extraxtion Finished: ev_charging_redemption...")
+
+
+##source table : gift_category
+t_gift_category = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'gift_category',
+                                                                transformation_ctx="gift_category")
+gift_category_df = t_gift_category.toDF()
+gift_category_df.createOrReplaceTempView("gift_category")
+print("Source Extraxtion Finished: gift_category...")
+
+##mapping table : gift_content
+t_gift_content = glueContext.create_dynamic_frame.from_catalog(database=db_03sub,
+                                                               table_name=prefix03 + 'staging_gift_content',
+                                                               transformation_ctx="staging_gift_content")
+gift_content_df = t_gift_content.toDF()
+print("Source Extraxtion Finished: gift_content...")
+
+##source table : coupon_category
+t_coupon_category = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'coupon_category',
+                                                                  transformation_ctx="coupon_category")
+coupon_category_df = t_coupon_category.toDF()
+coupon_category_df.createOrReplaceTempView("coupon_category")
+print("Source Extraxtion Finished: coupon_category...")
+
+##mapping table : coupon_content
+t_coupon_content = glueContext.create_dynamic_frame.from_catalog(database=db_03sub,
+                                                                 table_name=prefix03 + 'staging_coupon_content',
+                                                                 transformation_ctx="staging_coupon_content")
+coupon_content_df = t_coupon_content.toDF()
+print("Source Extraxtion Finished: coupon_content...")
+
+##source table : gift_redemption_transaction
+t_gift_redemption_transaction = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                              table_name=prefix + 'gift_redemption_transaction',
+                                                                              transformation_ctx="gift_redemption_transaction")
+gift_redemption_transaction_df = t_gift_redemption_transaction.toDF()
+print("Source Extraxtion Finished: gift_redemption_transaction...")
+
+##source table : point_dollar_transaction
+t_point_dollar_transaction = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                           table_name=prefix + 'point_dollar_transaction',
+                                                                           transformation_ctx="point_dollar_transaction")
+point_dollar_transaction_df = t_point_dollar_transaction.toDF()
+point_dollar_transaction_df.createOrReplaceTempView("point_dollar_transaction")
+print("Source Extraxtion Finished: point_dollar_transaction ...")
+
+##source table : bonus_point_to_point_dollar_transaction
+t_bonus_point_to_point_dollar_transaction = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                                          table_name=prefix + 'bonus_point_to_point_dollar_transaction',
+                                                                                          transformation_ctx="bonus_point_to_point_dollar_transaction")
+bonus_point_to_point_dollar_transaction_df = t_bonus_point_to_point_dollar_transaction.toDF()
+bonus_point_to_point_dollar_transaction_df.createOrReplaceTempView("bonus_point_to_point_dollar_transaction")
+print("Source Extraxtion Finished: bonus_point_to_point_dollar_transaction ...")
+
+##source table : coupon_redemption_transaction
+t_coupon_redemption_transaction = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                                table_name=prefix + 'coupon_redemption_transaction',
+                                                                                transformation_ctx="coupon_redemption_transaction")
+coupon_redemption_transaction_df = t_coupon_redemption_transaction.toDF()
+print("Source Extraxtion Finished: coupon_redemption_transaction ...")
+
+##mapping table : member
+t_member_staging = glueContext.create_dynamic_frame.from_catalog(database=db_03sub,
+                                                                 table_name=prefix03 + 'staging_member',
+                                                                 transformation_ctx="staging_member")
+member_df = t_member_staging.toDF()
+print("Source Extraxtion Finished: member...")
+
+##mapping table : point_or_cash_brand_list
+t_point_or_cash_brand_list = glueContext.create_dynamic_frame.from_catalog(database=db_03sub,
+                                                                           table_name=prefix03 + 'staging_point_or_cash_brand_list',
+                                                                           transformation_ctx="staging_point_or_cash_brand_list")
+point_or_cash_brand_list_df = t_point_or_cash_brand_list.toDF().select('brand_id',
+                                                                       col('brand_name').alias('reward_brand_name'))
+print("Source Extraxtion Finished: point_or_cash_brand_list...")
+
+##mapping table : point_or_cash_tiers
+t_point_or_cash_tiers = glueContext.create_dynamic_frame.from_catalog(database=db_03sub,
+                                                                      table_name=prefix03 + 'staging_point_or_cash_tiers',
+                                                                      transformation_ctx="staging_point_or_cash_tiers")
+point_or_cash_tiers_df = t_point_or_cash_tiers.toDF().select(col('gift_id').alias('mapping_gift_id'), 'reward_brand_id')
+print("Source Extraxtion Finished: point_or_cash_tiers...")
+
+##mapping table : gift_map_to_new_gift_cat
+gift_map_to_new_gift_cat_df = spark.read.csv(
+    dimension_path + 'tpdt_dim_gift_map_to_new_gift_cat/tpdt_dim_gift_map_to_new_gift_cat.csv', header='true',
+    inferSchema='true', sep=',').select(col('gift_id').alias('mapping_gift_id'), 'new_gift_type', 'new_sub_gift_type')
+print("Source Extraxtion Finished: gift_map_to_new_gift_cat...")
+
+##mapping table : dim_tp_mall_mapping
+mall_mapping_df = spark.read.csv(dimension_path + 'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv',
+                                 header='true', inferSchema='true', sep=',')
+mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+print("Source Extraxtion Finished: dim_tp_mall_mapping.csv...")
+
+##mapping table : shop
+t_shop = glueContext.create_dynamic_frame.from_catalog(database=db_03sub, table_name=prefix03 + 'staging_shop',
+                                                       transformation_ctx="staging_shop")
+shop_df = t_shop.toDF()
+shop_df.createOrReplaceTempView("staging_tp_shop")
+print("Source Extraxtion Finished: shop...")
+
+##mapping table : shop
+t_ods_rmcr_gift_mapping = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                                        table_name=bi_datemart_prefix + 'ods_rmcr_gift_mapping',
+                                                                        transformation_ctx="ods_rmcr_gift_mapping")
+ods_rmcr_gift_mapping_df = t_ods_rmcr_gift_mapping.toDF()
+ods_rmcr_gift_mapping_df.createOrReplaceTempView("ods_rmcr_gift_mapping")
+print("Source Extraxtion Finished: ods_rmcr_gift_mapping...")
+
+## mapping table : dim_abnormal_log.csv
+if env == 'prod':
+    t_abnormal_log = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                                   table_name='bi_datamart_ods_rmcr_abnormal_case',
+                                                                   transformation_ctx="dim_abnormal_log")
+    abnormal_log_df = t_abnormal_log.toDF().filter("type = 'transaction_id'")
+else:
+    abnormal_log_df = spark.read.csv(dimension_path + 'tpdt_dim_abnormal_log/tpdt_dim_abnormal_log.csv', header='true',
+                                     inferSchema='true', sep=',').filter("type = 'receipt_id'").filter(
+        "type = 'transaction_id'")
+abnormal_log_df.createOrReplaceTempView("dim_abnormal_log")
+print("Source Extraxtion Finished: dim_abnormal_log.csv...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Tranformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Transformation 1: Gift Part
+tmp_gift_type_aggregate = spark.sql("""
+		SELECT gift_category_id as mapping_gift_category_id, name_lang1 as gift_type
+		FROM  gift_category where parent_id is null  or parent_id = gift_category_id
+
+        union all
+
+		select t2.gift_category_id , t1.name_lang1
+		From  gift_category t1 right join
+		(
+			SELECT * FROM  gift_category
+			where parent_id is not null and parent_id != gift_category_id ) t2  on t1.gift_category_id=t2.parent_id
+		where t1.parent_id is null
+""")
+
+redemption_status_detail_dict = {
+    'P': 'Redeemed but not yet collected Mall Gift (CCC)',
+    'R': 'Redeemed and collected Mall Gift (CCC)',
+    'C': 'Cancelled Redemption of Mall Gift (CCC) or Shop Gift / SHKP Mall e-Gift Certificate',
+    'F': 'Redeemed but forfeited Mall Gift (CCC)',
+    'W': 'Point + Cash Waiting for Payment',
+    'L': 'Point + Cash Auto Cancellation'
+}
+
+
+def redeem_type_detail(type, points):
+    if type == 'S':
+        result = 'Redeem by receipt'
+    elif (type == 'B') and (points == 0):
+        result = 'Redeem by 0 point'
+    elif type == 'B':
+        result = 'Redeem by bonus point'
+    elif type == 'N':
+        result = 'point + cash type'
+    else:
+        result = None
+    return result
+
+
+redeem_type_detail_udf = udf(redeem_type_detail, StringType())
+
+
+def item_type_detail(type):
+    if type == 'C':
+        result = 'Free Parking'
+    else:
+        result = 'Mall Gift (CCC)'
+    return result
+
+
+item_type_detail_udf = udf(item_type_detail, StringType())
+
+gift_redemption_df = gift_redemption_transaction_df.select(
+    col('gift_redemption_transaction_id').alias('transaction_id'),
+    'status',
+    'redeem_type',
+    col('reserve_datetime').alias('redeem_datetime'),
+    col('reserve_expiry_date').alias('redeem_forfeit_datetime'),
+    col('redeem_datetime').alias('collected_or_used_datetime'),
+    'cancel_datetime',
+    'member_id',
+    'gift_id',
+    col('mall_id').alias('gift_redeemed_in_mall_id'),
+    'redeemed_tier',
+    'redeemed_bonus_points',
+    'redeemed_amount',
+    'payment_transaction_id',
+    'updated_date')
+gift_redemption_df.persist()
+
+redemption_status_detail_df = spark.createDataFrame(redemption_status_detail_dict.items(), schema=StructType(fields=[
+    StructField("mapping_status", StringType()),
+    StructField("redemption_status_detail", StringType())]))
+gift_content_df = gift_content_df.select(col('gift_id').alias('content_gift_id'),
+                                         col('mall_id').alias('provider_mall_id'),
+                                         'gift_category_id',
+                                         'extra_function',
+                                         col('name_lang1').alias('gift_name'),
+                                         col('value_amount').alias('gift_unit_cost'),
+                                         col('car_park_redeem_hours').alias('parking_redeem_hour'))
+
+gift_category_df = gift_category_df.select(col('gift_category_id').alias('mapping_gift_category_id'),
+                                           col('name_lang1').alias('sub_gift_type'))
+gift_redemption_df = gift_redemption_df.join(redemption_status_detail_df,
+                                             gift_redemption_df.status == redemption_status_detail_df.mapping_status,
+                                             how='left') \
+    .join(gift_content_df, gift_redemption_df.gift_id == gift_content_df.content_gift_id, how='left') \
+    .withColumn('redeem_type', redeem_type_detail_udf('redeem_type', 'redeemed_bonus_points'))
+
+gift_redemption_df = gift_redemption_df.join(tmp_gift_type_aggregate,
+                                             gift_redemption_df.gift_category_id == tmp_gift_type_aggregate.mapping_gift_category_id,
+                                             how='left') \
+    .join(gift_category_df, gift_redemption_df.gift_category_id == gift_category_df.mapping_gift_category_id,
+          how='left') \
+    .withColumn('item_type', item_type_detail_udf('extra_function')) \
+    .withColumn('gift_used_in_mall_id', lit(None).cast(IntegerType())) \
+    .withColumn('gift_used_in_shop_id', lit(None).cast(IntegerType())) \
+    .withColumn('linked_spend', lit(None).cast(IntegerType())) \
+    .withColumn('gift_used_ref_code', lit(None).cast(StringType()))
+# gift part final schema
+gift_redemption_df = gift_redemption_df.select('transaction_id',
+                                               'redemption_status_detail',
+                                               'redeem_type',
+                                               'redeem_datetime',
+                                               'redeem_forfeit_datetime',
+                                               'collected_or_used_datetime',
+                                               'cancel_datetime',
+                                               'provider_mall_id',
+                                               'member_id',
+                                               'item_type',
+                                               'gift_id',
+                                               'gift_type',
+                                               'sub_gift_type',
+                                               'gift_name',
+                                               'gift_unit_cost',
+                                               'gift_redeemed_in_mall_id',
+                                               'redeemed_tier',
+                                               'redeemed_bonus_points',
+                                               'redeemed_amount',
+                                               'payment_transaction_id',
+                                               'parking_redeem_hour',
+                                               'linked_spend',
+                                               'gift_used_in_mall_id',
+                                               'gift_used_in_shop_id',
+                                               'gift_used_ref_code',
+                                               'updated_date'
+                                               )
+
+# Transformation 2: Coupon Part
+tmp_coupon_type_aggregate = spark.sql("""
+		SELECT coupon_category_id as mapping_coupon_category_id, name_lang1  as gift_type
+		FROM  coupon_category where parent_id is null  or parent_id = coupon_category_id
+
+        union all
+
+		select t2.coupon_category_id , t1.name_lang1
+		From  coupon_category t1 right join
+		(
+			SELECT * FROM  coupon_category
+			where parent_id is not null and parent_id != coupon_category_id ) t2  on t1.coupon_category_id=t2.parent_id
+		where t1.parent_id is null
+""")
+
+coupon_redemption_status_detail_dict = {
+    'R': 'Redeemed but not yet used Shop Gift / SHKP Mall e-Gift Certificate',
+    'U': 'Redeemed and used Shop Gift / SHKP Mall e-Gift Certificate',
+    'C': 'Cancelled Redemption of Mall Gift (CCC) or Shop Gift / SHKP Mall e-Gift Certificate',
+    'E': 'Redeemed but forfeited Shop Gift / SHKP Mall e-Gift Certificate',
+    'W': 'Point + Cash Waiting for Payment',
+    'L': 'Point + Cash Auto Cancellation'
+}
+
+
+def coupon_item_type_detail(name, mall):
+    if name is None:
+        checking = 'Dummy'
+    else:
+        checking = name
+
+    if 'SHKP Mall e-Gift Certificate' in checking and mall == 0:
+        result = 'SHKP Mall e-Gift Certificate'
+    else:
+        result = 'Shop Gift'
+    return result
+
+
+coupon_item_type_detail_udf = udf(coupon_item_type_detail, StringType())
+
+coupon_redemption_df = coupon_redemption_transaction_df.select(
+    col('coupon_redemption_transaction_id').alias('transaction_id'),
+    'status',
+    'redeem_type',
+    'redeem_datetime',
+    col('expiry_date').alias('redeem_forfeit_datetime'),
+    col('used_datetime').alias('collected_or_used_datetime'),
+    'cancel_datetime',
+    'member_id',
+    'coupon_id',
+    col('mall_id').alias('gift_redeemed_in_mall_id'),
+    'redeemed_tier',
+    'redeem_bonus_points',
+    'redeemed_amount',
+    col('ref_code').alias('gift_used_ref_code'),
+    col('used_mall_id').alias('gift_used_in_mall_id'),
+    col('used_shop_id').alias('gift_used_in_shop_id'),
+    'payment_transaction_id',
+    'updated_date')
+coupon_redemption_df.persist()
+
+coupon_content_df = coupon_content_df.select(col('coupon_id').alias('content_coupon_id'),
+                                             col('mall_id').alias('provider_mall_id'),
+                                             'coupon_category_id',
+                                             col('name_lang1').alias('gift_name'),
+                                             col('value_amount').alias('gift_unit_cost'))
+
+coupon_redemption_status_detail_df = spark.createDataFrame(coupon_redemption_status_detail_dict.items(),
+                                                           schema=StructType(fields=[
+                                                               StructField("mapping_status", StringType()),
+                                                               StructField("redemption_status_detail", StringType())]))
+
+coupon_category_df = coupon_category_df.select(col('coupon_category_id').alias('mapping_coupon_category_id'),
+                                               col('name_lang1').alias('sub_gift_type'))
+coupon_redemption_df = coupon_redemption_df.join(coupon_redemption_status_detail_df,
+                                                 coupon_redemption_df.status == coupon_redemption_status_detail_df.mapping_status,
+                                                 how='left') \
+    .join(coupon_content_df, coupon_redemption_df.coupon_id == coupon_content_df.content_coupon_id, how='left') \
+    .withColumn('redeem_type', redeem_type_detail_udf('redeem_type', 'redeem_bonus_points')) \
+    .withColumn('parking_redeem_hour', lit(None).cast(IntegerType()))
+
+coupon_redemption_df = coupon_redemption_df.join(tmp_coupon_type_aggregate,
+                                                 coupon_redemption_df.coupon_category_id == tmp_coupon_type_aggregate.mapping_coupon_category_id,
+                                                 how='left') \
+    .join(coupon_category_df, coupon_redemption_df.coupon_category_id == coupon_category_df.mapping_coupon_category_id,
+          how='left') \
+    .withColumn('item_type', coupon_item_type_detail_udf('gift_name', 'provider_mall_id')) \
+    .withColumn('linked_spend', lit(None).cast(IntegerType()))
+
+coupon_redemption_df = coupon_redemption_df.select('transaction_id',
+                                                   'redemption_status_detail',
+                                                   'redeem_type',
+                                                   'redeem_datetime',
+                                                   'redeem_forfeit_datetime',
+                                                   'collected_or_used_datetime',
+                                                   'cancel_datetime',
+                                                   'provider_mall_id',
+                                                   'member_id',
+                                                   'item_type',
+                                                   'coupon_id',
+                                                   'gift_type',
+                                                   'sub_gift_type',
+                                                   'gift_name',
+                                                   'gift_unit_cost',
+                                                   'gift_redeemed_in_mall_id',
+                                                   'redeemed_tier',
+                                                   'redeem_bonus_points',
+                                                   'redeemed_amount',
+                                                   'payment_transaction_id',
+                                                   'parking_redeem_hour',
+                                                   'linked_spend',
+                                                   'gift_used_in_mall_id',
+                                                   'gift_used_in_shop_id',
+                                                   'gift_used_ref_code',
+                                                   'updated_date')
+
+# Transformation 3: Point Dollar Part
+tmp_point_dollar_transaction_payment = spark.sql("""
+	Select
+		trans_id,
+		amount,
+		mall_id,
+		shop_id,
+		trans_date,
+		total_amount,
+		trans_type
+	from point_dollar_transaction
+	where trans_type = 'P'
+""")
+tmp_point_dollar_transaction_payment.createOrReplaceTempView("tmp_point_dollar_transaction_payment")
+
+tmp_point_dollar_transaction_refund = spark.sql("""
+	Select
+		trans_id,
+		ori_trans_id,
+		ori_trans_date,
+		trans_date,
+		amount,
+		total_amount,
+		trans_type
+	from point_dollar_transaction
+	where trans_type = 'R'
+""")
+tmp_point_dollar_transaction_refund.createOrReplaceTempView("tmp_point_dollar_transaction_refund")
+
+tmp_pointdollar_payment = spark.sql("""
+	Select Distinct
+		t1.trans_id,
+		t1.created_date,
+		t1.status,
+		t1.dollar_value,
+		t1.exchange_rate,
+		t1.member_id,
+		t1.points,
+		t2.amount,
+		t2.total_amount,
+		t2.mall_id,
+		t2.shop_id,
+		t2.trans_date,
+		t2.trans_type,
+		t1.point_dollar_transaction_id,
+		t1.updated_date
+	from bonus_point_to_point_dollar_transaction t1
+	inner join tmp_point_dollar_transaction_payment t2 on t1.point_dollar_transaction_id = t2.trans_id
+""")
+tmp_pointdollar_payment.createOrReplaceTempView("tmp_pointdollar_payment")
+
+tmp_pointdollar_refund = spark.sql("""
+	Select Distinct
+		t1.trans_id,
+		t1.created_date,
+		t1.status,
+		t1.dollar_value,
+		t1.exchange_rate,
+		t1.member_id,
+		t2.ori_trans_id,
+		t2.ori_trans_date,
+		t2.trans_date,
+		t2.trans_type,
+		t2.amount,
+		t2.total_amount
+	from bonus_point_to_point_dollar_transaction t1
+	inner join tmp_point_dollar_transaction_refund t2 on t1.point_dollar_transaction_id = t2.trans_id
+""")
+tmp_pointdollar_refund.createOrReplaceTempView("tmp_pointdollar_refund")
+
+pointdollar_redemption_df = spark.sql("""
+	Select
+		Distinct
+		t1.trans_id	as transaction_id,
+		case 	when t2.trans_date is null then 'Used Point Dollar for Spending'
+				else 'Refunded Point Dollar Transaction' end as redemption_status_detail,
+		'Point Dollar' as redeem_type,
+		t1.trans_date as redeem_datetime,
+		null as redeem_forfeit_datetime,
+		t1.trans_date as collected_or_used_datetime,
+		t2.trans_date as cancel_datetime,
+		0 as provider_mall_id,
+		t1.member_id,
+		'Point Dollar' as item_type,
+		t1.point_dollar_transaction_id as gift_id,
+		'Point Dollar' as gift_type,
+		'Point Dollar' as sub_gift_type,
+		Null as gift_name,
+		t1.amount as gift_unit_cost,
+		t1.mall_id as gift_redeemed_in_mall_id,
+		null as redeemed_tier,
+		t1.points * -1 as redeemed_bonus_points,
+		0 as redeemed_amount,
+		null as payment_transaction_id,
+		null as parking_redeem_hour,
+		t1.total_amount as linked_spend,
+		t1.mall_id as gift_used_in_mall_id,
+		t1.shop_id as gift_used_in_shop_id,
+		null as gift_used_ref_code,
+		t1.updated_date
+	from tmp_pointdollar_payment t1
+	left join tmp_pointdollar_refund t2 				on t1.point_dollar_transaction_id = t2.ori_trans_id;
+""")
+
+evcharging_redemption_raw = spark.sql("""
+    Select t1.*, total_points, rank() OVER (PARTITION BY t1.member_id, t1.mall_id, date(t1.created_datetime) ORDER BY t1.created_datetime, bonus_points_transaction_id) as ranking
+    from ev_charging_redemption t1
+    left join (Select member_id, mall_id, date(created_datetime) as created_date, sum(points) as total_points from ev_charging_redemption where points < 0 group by member_id, mall_id, date(created_datetime)) t2
+    on t1.member_id = t2.member_id and t1.mall_id = t2.mall_id and date(t1.created_datetime) = t2.created_date
+""")
+evcharging_redemption_raw.createOrReplaceTempView("evcharging_redemption_raw")
+
+evcharging_redemption_df = spark.sql("""
+	Select
+		Distinct
+		bonus_points_transaction_id	as transaction_id,
+		'Redeem for the EV charging fee' as redemption_status_detail,
+		'Redeem by bonus point' as redeem_type,
+		created_datetime + INTERVAL 8 HOURS as redeem_datetime,
+		null as redeem_forfeit_datetime,
+		created_datetime + INTERVAL 8 HOURS as collected_or_used_datetime,
+		null as cancel_datetime,
+		cast(mall_id as int) as provider_mall_id,
+		member_id,
+		'Redeem for the EV charging fee' as item_type,
+		'Redeem for the EV charging fee' as gift_id,
+		'Redeem for the EV charging fee' as gift_type,
+		'Redeem for the EV charging fee' as sub_gift_type,
+		'Redeem for the EV charging fee' as gift_name,
+		0 as gift_unit_cost,
+		cast(mall_id as int) as gift_redeemed_in_mall_id,
+		null as redeemed_tier,
+		cast(total_points as int) * -1 as redeemed_bonus_points,
+		0 as redeemed_amount,
+		null as payment_transaction_id,
+		null as parking_redeem_hour,
+		null as linked_spend,
+		cast(mall_id as int) as gift_used_in_mall_id,
+		null as gift_used_in_shop_id,
+		null as gift_used_ref_code,
+		updated_date + INTERVAL 8 HOURS as updated_date
+	from evcharging_redemption_raw
+	where points < 0 and ranking = 1
+""")
+
+# Transformation 4: Final Mapping
+def redeem_method(type, amount, points):
+    if type == 'Point Dollar':
+        result = 'Point Dollar'
+    elif type == 'Redeem by bonus point':
+        result = 'Full Point'
+    elif type == 'Redeem by receipt':
+        result = 'Full Spending'
+    elif type == 'Redeem by 0 point':
+        result = 'Redeem by 0 point'
+    elif (type == 'point + cash type') and (amount == 0):
+        result = 'Full Point'
+    elif (type == 'point + cash type') and (points == 0):
+        result = 'Full Cash'
+    elif (type == 'point + cash type') and (amount != 0) and (points != 0):
+        result = 'Point + Cash'
+    else:
+        result = None
+    return result
+
+
+redeem_method_udf = udf(redeem_method, StringType())
+
+dw_redemption_staging = gift_redemption_df.unionAll(coupon_redemption_df) \
+                                            .unionAll(pointdollar_redemption_df)\
+                                            .unionAll(evcharging_redemption_df)
+
+dw_redemption_staging.persist()
+tmp_brand = point_or_cash_tiers_df.join(point_or_cash_brand_list_df, point_or_cash_tiers_df.reward_brand_id == point_or_cash_brand_list_df.brand_id, how='left')
+
+dw_redemption_staging = dw_redemption_staging.join(member_df, dw_redemption_staging.member_id == member_df.mapping_member_id, how='left') \
+                                                .join(tmp_brand, dw_redemption_staging.gift_id == tmp_brand.mapping_gift_id, how='left') \
+                                                .join(gift_map_to_new_gift_cat_df, dw_redemption_staging.gift_id == gift_map_to_new_gift_cat_df.mapping_gift_id, how='left') \
+                                                .withColumn('redeem_method', redeem_method_udf('redeem_type', 'redeemed_amount', 'redeemed_bonus_points'))
+dw_redemption_staging.createOrReplaceTempView("dw_redemption_staging")
+
+# Transformation 4: Final Schema
+dw_redemption = spark.sql("""
+    Select  Distinct
+            t1.transaction_id,
+            t1.redemption_status_detail,
+            case when t1.registration_date <= '2019-03-12' then 1 else 0 end as is_staff,
+            t1.redeem_type,
+            t1.redeem_datetime,
+            cast(date_format(t1.redeem_datetime - INTERVAL 8 HOURS,'yyyy-MM-dd') as date) as redeem_date,
+            case when weekday(t1.redeem_datetime - INTERVAL 8 HOURS) between 0 and 4 then 'Weekday'
+				 when weekday(t1.redeem_datetime - INTERVAL 8 HOURS) between 5 and 6 then 'Weekend'
+				 else NULL end as redeem_datetime_weekday,
+			t1.redeem_forfeit_datetime,
+			t1.collected_or_used_datetime,
+			t1.cancel_datetime,
+			t1.provider_mall_id,
+			t2.property_id as provider_property_id,
+			t1.member_id,
+			t1.member_status_detail,
+			t1.gender,
+			t1.age,
+			t1.age_group,
+			t1.residence,
+			t1.district,
+			t1.member_tier,
+			t1.item_type,
+			t1.gift_id,
+			case when t1.new_gift_type is not null then
+			        case when t1.new_gift_type == 'NULL' then NULL else trim(t1.new_gift_type) end
+			     else
+			        case when t1.gift_type == 'NULL' then NULL else trim(t1.gift_type) end
+			     end as gift_type,
+			case when t1.new_sub_gift_type is not null then
+			        case when new_sub_gift_type == 'NULL' then NULL else trim(new_sub_gift_type) end
+			     else
+			        case when t1.sub_gift_type == 'NULL' then NULL else trim(t1.sub_gift_type) end
+			     end as sub_gift_type,
+			trim(t6.`Business Nature`) as gift_business_nature,
+			t6.`LMS Standard Trade Category` as gift_trade_category,
+			trim(t6.`LMS Standard Brand Name (Eng)`) as gift_brand,
+			trim(replace(replace(t6.`Face Unit Value HK$`,'HK$',''),',','')) as gift_face_unit_value,
+			t1.gift_name,
+			t1.gift_unit_cost,
+			t1.gift_redeemed_in_mall_id,
+			t3.property_id as gift_redeemed_in_property_id,
+			t1.redeemed_tier,
+			t1.redeemed_bonus_points,
+			t1.redeemed_amount,
+			t1.payment_transaction_id,
+			t1.parking_redeem_hour,
+			t1.linked_spend,
+			case when t7.value is not null then 1 else 0 end as abnormal_case,
+			t1.gift_used_in_mall_id,
+			t4.property_id as gift_used_in_property_id,
+			t1.gift_used_in_shop_id,
+			t5.shop_name as gift_used_in_shop_name,
+			t5.lms_standard_brand_name as gift_used_in_lms_standard_brand_name,
+			t1.gift_used_ref_code,
+			t1.redeem_method,
+			t1.reward_brand_id,
+			t1.reward_brand_name,
+			t1.updated_date,
+			cast(date_format(t1.redeem_datetime - INTERVAL 8 HOURS,'yyyy-MM-dd') as date) as partitionkey
+	From dw_redemption_staging      t1
+	Left Join dim_tp_mall_mapping   t2 on t1.provider_mall_id = t2.mall_id
+	Left Join dim_tp_mall_mapping   t3 on t1.gift_redeemed_in_mall_id = t3.mall_id
+	Left Join dim_tp_mall_mapping   t4 on t1.gift_used_in_mall_id = t4.mall_id
+	Left Join staging_tp_shop           t5 on t1.gift_used_in_shop_id = t5.mapping_shop_id
+	Left Join ods_rmcr_gift_mapping t6 on t6.`The Point CMS Gift ID` = t1.gift_id
+	Left join dim_abnormal_log t7 on t7.value = t1.transaction_id
+	where member_id <> 'SHKP0519009'
+	""")
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+dw_redemption.write.format('parquet').mode('overwrite').partitionBy("partitionkey").option("header", True).save(output_path)
+print(f"Result Saved in {output_path}...")
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+

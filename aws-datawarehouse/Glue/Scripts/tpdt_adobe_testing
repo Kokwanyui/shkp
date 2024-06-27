@@ -1,0 +1,281 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType 
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.window import Window
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+ 
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-adobe-1/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    district_mapping_s3_location = 's3://tpdt-dimension/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-adobe-1-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    district_mapping_s3_location = 's3://tpdt-dimension-'+env+'/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+bi_prefix = 'bi_datamart_'
+dimension_prefix = 'bi_dimension_'
+suffix = datetime.now().astimezone(timezone(timedelta(hours=8))).strftime("%Y%m%d%H%M%S")
+s3_folder = 'to_adobe'
+"""
+t_registration = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_setting', transformation_ctx = "registration")
+registration_df = t_registration.toDF().select('member_id', 
+'receive_promotion_msg',  
+'receive_promotion_sms',  
+'receive_promotion_email',  
+'receive_promotion_mail',  
+'receive_promotion_call')
+
+registration_df.write.format('parquet').mode('overwrite').option("header",True).save('s3://tpdt-adhoc/tpdt_member_setting/')
+"""
+
+
+
+## udfs
+def clean_s3(root_folder, sub_folder):
+    # clean all objects in folder
+    s3 = boto3.resource('s3',region_name='ap-southeast-1')
+    clean_bucket = s3.Bucket('tpdt-adobe-1')
+    clean_prefix = f'{root_folder}/{sub_folder}'
+    clean_bucket.objects.filter(Prefix=clean_prefix).delete()
+    
+    
+def save_df(df, separator, root_folder):
+    # clean tmp folder
+    sub_folder='temp/'
+    clean_s3(root_folder, sub_folder)
+
+    # save temp file
+    output_path = f"s3://tpdt-adobe-1/{root_folder}/temp"
+    df.coalesce(1).write.mode("overwrite").option("timestampFormat", "yyyy-MM-dd HH:mm:ss").option("dateFormat", "yyyy-MM-dd").option("compression", "gzip").csv(output_path, header="true", sep=separator)
+
+
+def renaming_output(root_folder, cdp_tablename):
+    # renaming config
+    s3 = boto3.client('s3',region_name='ap-southeast-1')
+    BucketName = 'tpdt-adobe-1'
+    FolderName = f'{root_folder}/temp/'
+    FinalFolder = f'{root_folder}/'
+    
+    NewFile = f'{FinalFolder}{cdp_tablename}_{suffix}.csv.gz'
+    response = s3.list_objects(
+        Bucket= BucketName,
+        MaxKeys = 2,
+        Prefix=FolderName
+        )
+    OldFile=response['Contents'][0]['Key']
+    OldSource=BucketName + '/' +   OldFile
+    
+    # move file and rename
+    rename_file = boto3.resource('s3',region_name='ap-southeast-1')
+    rename_file.Object(BucketName,NewFile).copy_from(CopySource=OldSource)
+    rename_file.Object(BucketName,OldFile).delete()
+
+## Step 1: clean whole s3 bucket
+clean_s3(s3_folder, '')
+
+## Tables  -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : MemberRegistrationSource------------------
+t_registration = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_member_registration', transformation_ctx = "registration")
+registration_df = t_registration.toDF().select('member_id', 'from_mall_id', 'from_mall_name', 'channel', 'link', 'mall_non_mall', 'team', 'source', 'medium', 'campaign', 'allocate_mall_non_mall', 'allocate_team', 'allocate_source')\
+                                       .withColumn('from_mall_id', when(col('from_mall_id')=='__HIVE_DEFAULT_PARTITION__', lit('NULL')).otherwise(col('from_mall_id')))\
+                                       .withColumn('channel', regexp_replace('channel', '|', ' '))\
+                                       .withColumn('link', regexp_replace('link', '|', ' '))
+
+sep_by = '|'
+cdp_table_name = 'MemberRegistrationSource'
+save_df(registration_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+##source table : GiftRedemption------------------
+t_redemption = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_redemption', transformation_ctx = "dw_redemption")
+redemption_df = t_redemption.toDF().select('transaction_id'
+    ,'redemption_status_detail'
+    ,'redeem_type'
+    ,'redeem_datetime'
+    ,'redeem_forfeit_datetime'
+    ,'collected_or_used_datetime'
+    ,'cancel_datetime'
+    ,col('provider_mall_id').alias('mall_id')
+    ,col('provider_property_id').alias('property_id')
+    ,'member_id'
+    ,'item_type'
+    ,'gift_id'
+    ,'gift_type'
+    ,'sub_gift_type'
+    ,when(col('sub_gift_type')=='Point Dollar',lit('Point Dollar')).otherwise(col('gift_name')).alias('gift_name')
+    ,'gift_unit_cost'
+    ,'gift_face_unit_value'
+    ,'gift_redeemed_in_mall_id'
+    ,'gift_redeemed_in_property_id'
+    ,lit(1).alias('redeemed_qty')
+    ,'redeemed_bonus_points'
+    ,'parking_redeem_hour'
+    ,'gift_used_in_mall_id'
+    ,'gift_used_in_property_id'
+    ,'gift_used_in_shop_id'
+    ,'gift_used_in_shop_name'
+    ,'gift_used_in_lms_standard_brand_name')\
+    .filter("redemption_status_detail not in ('Cancelled Redemption of Mall Gift (CCC) or Shop Gift / SHKP Mall e-Gift Certificate', 'Point + Cash Auto Cancellation')")\
+    .filter("redeem_datetime >= last_day(current_date - INTERVAL 13 MONTHS) + INTERVAL 1 DAYS")\
+    .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification')")\
+    .filter("CONCAT(CAST(redeemed_bonus_points AS string), redeem_type, provider_property_id) not in ('0Redeem by bonus pointRMCR', '0Redeem by 0 pointRMCR')")\
+    .filter("Abnormal_case = 0")\
+    .filter("redeem_date < current_date()")\
+    .withColumn('gift_name', translate(col('gift_name'), '|', ''))\
+    .withColumn('gift_name', translate(col('gift_name'), '\"', ''))\
+    .withColumn('gift_used_in_shop_name', translate(col('gift_used_in_shop_name'), '\"', ''))\
+    .withColumn('gift_used_in_lms_standard_brand_name', translate(col('gift_used_in_lms_standard_brand_name'), '\"', '')) 
+
+sep_by = '|'
+cdp_table_name = 'GiftRedemption'
+save_df(redemption_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+##source table : SpendingTransaction------------------
+t_spending = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "dw_spending")
+spending_df = t_spending.toDF()\
+                            .filter("receipt_status_detail = 'Approved'")\
+                            .filter("receipt_transaction_date >= last_day(current_date - INTERVAL 13 MONTHS) + INTERVAL 1 DAYS")\
+                            .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification')")\
+                            .filter("Team not in ('Partner')")\
+                            .filter("Abnormal_case = 0")\
+                            .filter("receipt_upload_date < current_date()")
+spending_df.createOrReplaceTempView("dm_spending_master")
+
+tmp_spending_sp = spark.sql("""
+select 
+     receipt_id
+    ,replace(invoice_no , '|',' ') as invoice_no
+    ,receipt_status_detail
+    ,receipt_upload_datetime
+    ,receipt_transaction_date
+    ,receipt_transaction_datetime
+    ,spending_transaction_id
+    ,approve_or_reject_by
+    ,approve_or_reject_datetime
+    ,receipt_type_detail
+    ,mall_id
+    ,property_id
+    ,team
+    ,member_id
+    ,shop_id
+    ,replace(shop_name , '|',' ') as shop_name
+    ,replace(lms_trade_name , '|',' ') as lms_trade_name
+    ,replace(lms_standard_brand_name , '|',' ') as lms_standard_brand_name
+    ,replace(lms_standard_trade_category , '|',' ') as lms_standard_trade_category
+    ,replace(lms_standard_group , '|',' ') as lms_standard_group
+    ,payment_type
+    ,receipt_amount
+    ,earned_points
+    ,updated_date
+    ,platform
+    ,partner
+    ,case when ocr_auto_approved = True then 1 else 0 end as ocr_auto_approved
+from dm_spending_master """)
+
+sep_by = '|'
+cdp_table_name = 'SpendingTransaction'
+save_df(tmp_spending_sp, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+
+##source table : SpendingAggregateByMonth------------------
+tmp_monthly_spending = spark.sql("""
+    select member_id , date_format(receipt_transaction_date ,'yyyy') as year_id ,  date_format(receipt_transaction_date ,'MM') as month_id ,
+    property_id , 
+    case when lms_standard_trade_category is null then 'Others' else lms_standard_trade_category end as lms_standard_trade_category ,
+    platform ,partner ,
+    sum(receipt_amount ) as spending_amount , count(distinct receipt_id) as number_of_receipt
+    from  dm_spending_master
+    where receipt_transaction_date >= last_day(current_date - INTERVAL 13 MONTHS) + INTERVAL 1 DAYS
+    group by member_id , receipt_transaction_date ,property_id  ,
+    case when lms_standard_trade_category is null then 'Others' else lms_standard_trade_category end  , platform ,partner 
+""")
+
+
+tmp_monthly_spending = tmp_monthly_spending.withColumn(
+    "spending_aggregate_id",
+    row_number().over(Window.orderBy(monotonically_increasing_id()))
+)
+
+
+tmp_monthly_spending.createOrReplaceTempView("monthly_spend_aggregate")
+
+
+tmp_monthly_spending_sp = spark.sql("""
+    select  spending_aggregate_id  ,member_id  ,year_id ,
+    month_id  ,property_id  ,lms_standard_trade_category ,
+    platform  ,partner ,spending_amount  ,number_of_receipt 
+    from monthly_spend_aggregate 
+""")
+
+sep_by = '|'
+cdp_table_name = 'SpendingAggregateByMonth'
+save_df(tmp_monthly_spending_sp, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+##source table : bonus_points_transaction------------------
+t_bonus_points_transaction = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_bp_transaction', transformation_ctx = "dw_bp_transaction")
+bonus_points_df = t_bonus_points_transaction.toDF()\
+                            .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification')")\
+                            .filter("abnormal_case = 0")\
+                            .filter("created_datetime_before_launch = 0")\
+                            .filter("created_date >= last_day(current_date - INTERVAL 13 MONTHS) + INTERVAL 1 DAYS")\
+                            .select('bonus_points_transaction_id'
+                                    ,'created_datetime'
+                                    ,'mall_id'
+                                    ,'property_id'
+                                    ,'member_id'
+                                    ,'bp_transaction_type'
+                                    ,'bp_transaction_type_detail_1'
+                                    ,'bp_transaction_type_detail_2'
+                                    ,'points'
+                                    ,'remark'
+                                    ,'expiry_date'
+                                    ,'updated_date')\
+                            .withColumn('remark', translate(col('remark'), '|', ' '))\
+                            .withColumn('bp_transaction_type_detail_2', translate(col('bp_transaction_type_detail_2'), '\"', ''))\
+                            .withColumn('bp_transaction_type_detail_1', translate(col('bp_transaction_type_detail_1'), '\"', '')) 
+
+
+sep_by = '|'
+cdp_table_name = 'PointsTransaction'
+save_df(bonus_points_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)

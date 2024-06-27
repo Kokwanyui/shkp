@@ -1,0 +1,117 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-parking/tpdt_ev_rsr_raw_final/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-parking-"+env+"/tpdt_ev_rsr_raw_final/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_vip_member', transformation_ctx = "member")
+member_df = t_member.toDF().select(col('member_id').alias('memberId')).filter("status = 'V'")
+member_df.createOrReplaceTempView("member")
+print("Source Extraction Finished: Member...")
+
+##source table : tpdt_ev_rsr_raw
+ev_rsr_raw_df = spark.read.json("s3://tpdt-parking/tpdt_ev_rsr_raw/*.json")
+ev_rsr_raw_df.createOrReplaceTempView("ev_rsr_raw_df")
+print("Source Extraxtion Finished: tpdt_ev_rsr_raw.json...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+ev_rsr_raw_final = ev_rsr_raw_df.join(member_df, upper(ev_rsr_raw_df.externalMemberId) == upper(member_df.memberId), how='left') \
+    .withColumn('lp_final', when(col('memberId').isNotNull() & col('lp').isNotNull(), sha2(upper(col('lp')), 256)).otherwise(col('lp'))) \
+    .withColumn('lpin_final', when(col('memberId').isNotNull() & col('lpin').isNotNull(), sha2(upper(col('lpin')), 256)).otherwise(col('lpin'))) \
+    .withColumn('lpout_final', when(col('memberId').isNotNull() & col('lpOut').isNotNull(), sha2(upper(col('lpOut')), 256)).otherwise(col('lpOut'))) \
+    .select(col('rsrId').alias('rsrid'),
+            col('duration').alias('duration'),
+            col('status').alias('status'),
+            col('createDttm').alias('createdttm'),
+            col('startDttm').alias('startdttm'),
+            col('endDttm').alias('enddttm'),
+            col('actualEndDttm').alias('actualenddttm'),
+            col('lupdDttm').alias('lupddttm'),
+            col('tranId').alias('tranid'),
+            col('chargerId').alias('chargerid'),
+            col('connector').alias('connector'),
+            col('stopType').alias('stoptype'),
+            col('externalMemberId').alias('externalmemberid'),
+            col('mallId').alias('mallid'),
+            col('carparkId').alias('carparkid'),
+            col('gracePeriodEndDttm').alias('graceperiodenddttm'),
+            col('expectedChargingFee').alias('expectedchargingfee'),
+            col('expectedPenaltyFee').alias('expectedpenaltyfee'),
+            col('currentUnitSession').alias('currentunitsession'),
+            col('pointRedemption').alias('pointredemption'),
+            col('redeemUnitSessions').alias('redeemunitsessions'),
+            col('lp_final').alias('lp'),
+            col('redeemCount').alias('redeemcount'),
+            col('penaltyMins').alias('penaltymins'),
+            col('sessionUnitExpectedEndTime').alias('sessionunitexpectedendtime'),
+            col('actualFinishedTime').alias('actualfinishedtime'),
+            col('redeemExpireTime').alias('redeemexpiretime'),
+            col('referenceFee').alias('referencefee'),
+            col('referencePenalty').alias('referencepenalty'),
+            col('referencePoint').alias('referencepoint'),
+            col('referenceChargingUnit').alias('referencechargingunit'),
+            col('referencePenaltyUnit').alias('referencepenaltyunit'),
+            col('referenceMaxChargingUnit').alias('referencemaxchargingunit'),
+            col('paymentResultId').alias('paymentresultid'),
+            col('brandIn').alias('brandin'),
+            col('brandOut').alias('brandout'),
+            col('lpin_final').alias('lpin'),
+            col('lpout_final').alias('lpout'),
+            col('lprsSessionId').alias('lprssessionid'),
+            col('evDisconnectedTime').alias('evdisconnectedtime'),
+            col('carEntryTime').alias('carentrytime'),
+            col('carLeaveTime').alias('carleavetime'),
+            col('lprsBayId').alias('lprsbayid')
+            )
+ev_rsr_raw_final.createOrReplaceTempView("ev_rsr_raw_final")
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+ev_rsr_raw_final.write.format('parquet').mode('overwrite').option("header", True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

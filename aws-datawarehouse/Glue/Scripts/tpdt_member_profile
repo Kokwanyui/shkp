@@ -1,0 +1,119 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql.functions import *
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql.window import Window
+import time
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db02 = "tpdt_02replica"
+    db03 = "tpdt_03dw"
+    db03sub = "tpdt_03sub"
+    db03ad = "tpdt_03adobe"
+    db03parking = "tpdt_03parking"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    db03sub = "tpdt_03sub_" + env
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+
+prefix = "shkpmalls_vip_"
+prefix03 = 'tpdt_'
+bi_prefix = 'bi_datamart_'
+dimension_prefix = 'bi_dimension_'
+
+
+def run_athena(script, db, output_location):
+    """Execute Athena Query and get execution_id"""
+    client = boto3.client('athena')
+
+    execution_id = client.start_query_execution(
+                                                QueryString=script,
+                                                QueryExecutionContext={'Database': db},
+                                                ResultConfiguration={'OutputLocation': output_location}
+                                                )['QueryExecutionId']
+
+    return execution_id
+
+def get_filename(athena_execution_id, max_execution_time):
+    """Check Running Status and get final result path"""
+    client = boto3.client('athena')
+    state = 'RUNNING'
+
+    while (max_execution_time > 0 and state in ['RUNNING', 'QUEUED']):
+        max_execution_time = max_execution_time - 1
+        response = client.get_query_execution(QueryExecutionId=athena_execution_id)
+
+        if 'QueryExecution' in response and 'Status' in response['QueryExecution'] and 'State' in response['QueryExecution']['Status']:
+            state = response['QueryExecution']['Status']['State']
+            if state == 'FAILED':
+                return json.loads(json.dumps(response, default=str))
+            elif state == 'SUCCEEDED':
+                s3_path = response['QueryExecution']['ResultConfiguration']['OutputLocation']
+                return s3_path
+        time.sleep(60)
+
+DATABASE = 'tpdt_03segmentation'
+target_view = 'member_profile'
+output_path = "s3://tpdt-athena-queryresult/"
+query_string = f'Select * from {DATABASE}.{target_view}'
+max_execution = 5
+
+execution_id = run_athena(query_string, DATABASE, output_path)
+final_path = get_filename(execution_id, max_execution)
+member_profile_df = spark.read.format("csv").option("header", "true").load(final_path)
+
+
+member_profile_df = member_profile_df.withColumn("age", col("age").cast('int')) \
+                                        .withColumn("registration_date", to_date(col("registration_date"), "yyyy-MM-dd")) \
+                                        .withColumn("registration_year", col("registration_year").cast('int')) \
+                                        .withColumn("parker", col("parker").cast('int')) \
+                                        .withColumn("higher_confident_driver", col("higher_confident_driver").cast('int')) \
+                                        .withColumn("main_parker", col("main_parker").cast('int')) \
+                                        .withColumn("ever_used_ev", col("ever_used_ev").cast('int')) \
+                                        .withColumn("existing_contactless", col("existing_contactless").cast('int')) \
+                                        .withColumn("smt_overlap", col("smt_overlap").cast('int')) \
+                                        .withColumn("professional_buyer", col("professional_buyer").cast('int')) \
+                                        .withColumn("professional_buyer_old_logic", col("professional_buyer_old_logic").cast('int')) \
+                                        .withColumn("affluent_spender", col("affluent_spender").cast('int')) \
+                                        .withColumn("top_spender", col("top_spender").cast('int')) \
+                                        .withColumn("general_shopper", col("general_shopper").cast('int')) \
+                                        .withColumn("spending_in_top_mall", col("spending_in_top_mall").cast(DoubleType()))
+
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+member_profile_df_output_path = "s3://tpdt-segmentation/tpdt_member_profile/"
+member_profile_df.write.format('parquet').mode('overwrite').partitionBy("age_group").option("header", True).save(member_profile_df_output_path)
+print(f"Result Saved in {member_profile_df_output_path}...")
+
+job.commit()
+
+# Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

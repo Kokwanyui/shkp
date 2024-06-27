@@ -1,0 +1,101 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-staging/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-staging-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+## source table : condition 
+t_condition = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'condition', transformation_ctx = "condition")
+condition_df = t_condition.toDF()
+condition_df.createOrReplaceTempView("condition")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+basic_df = spark.sql("""select  distinct  created_by, created_date, status, updated_by, updated_date, type as basic_type, parent_id,spending_condition_relation from  condition where condition_id > 0""")
+
+conditiontypes_df = spark.sql(""" SELECT distinct condition_type  from  condition  """)
+conditiontypes_list = conditiontypes_df.select('condition_type').collect()
+conditiontypes_array = [int(row.condition_type) for row in conditiontypes_list]
+conditiontypes=len(conditiontypes_array)
+
+for conditiontype in range(conditiontypes):
+    mapping_id = 'parent_id_'+str(conditiontype)
+    
+    conditiontype_dfquery = "select distinct parent_id , condition_json from condition where condition_type='{}'".format(conditiontypes_array[conditiontype])
+    conditiontype_df = spark.sql(conditiontype_dfquery)
+    
+    json_schema = spark.read.json(conditiontype_df.rdd.map(lambda row: row.condition_json)).schema
+    conditiontype_df = conditiontype_df.withColumn('json', from_json(col('condition_json'), json_schema)).select(col('parent_id').alias(mapping_id), 'json.*')
+    print(conditiontype_df.printSchema())
+    print(conditiontype_df.show(5))
+    
+    basic_df = basic_df.join(conditiontype_df, basic_df.parent_id == conditiontype_df[mapping_id], how='left')
+    basic_df = basic_df.drop(col(mapping_id))
+
+print(basic_df.printSchema())   
+weekday_df = basic_df.select('parent_id', explode(col('weekday')).alias('weekday'))
+
+detail_df = basic_df.drop('weekday', 'special_date')
+detail_df = detail_df.withColumnRenamed('type','frequency_type')\
+                     .withColumnRenamed('basic_type','type')
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Results into target destination...")
+# ods_condition_weekday
+weekday_output_path=staging_path+'tpdt_staging_condition_weekday'
+weekday_df.write.format('parquet').mode('overwrite').option("header",True).save(weekday_output_path)
+print(f"Result Saved in {weekday_output_path}...")
+
+# ods_condition_detail
+detail_output_path=staging_path+"tpdt_staging_condition_detail"
+detail_df.write.format('parquet').mode('overwrite').option("header",True).save(detail_output_path)
+job.commit()
+print(f"Result Saved in {detail_output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+

@@ -1,0 +1,1311 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Stack to deploy resources and tasks for parking
+
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  DBprefix:
+    Type: String
+    Default: tp03
+  GlueIamRole:
+    Type: String
+  GlueVersion:
+    Type: String
+  GlueDBdw:
+    Type: String
+  GlueDB01replica:
+    Type: String
+  S3ArtifactBucket:
+    Type: String
+  GluejobNumberOfWorkers:
+    Type: Number
+    Description: number of workers for Glue Job
+  S3NameGlueTemporary:
+    Type: String
+  GlueConnector01replica:
+    Type: String
+  lambdaIamRole:
+    Type: String
+  accountid:
+    Type: String
+
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+
+Resources:
+# Creating S3 Buckets - Start
+  S3parking:
+    Description: bucket to store parking ETL result
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - parking
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: parking
+# Creating S3 Buckets - End
+
+
+# Creating Glue DataBase - Start
+  GlueDBparking:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database to connect S3parking bucket
+        LocationUri: !Sub 's3://${S3parking}/'
+        Name: !Join
+          - '_'
+          - - !Ref AWSTeam
+            - 03parking
+            - !If
+              - IsNotPrd
+              - !Ref AWSEnv
+              - !Ref 'AWS::NoValue'
+# Creating Glue DataBase - End
+
+# Creating Glue S3 Crawler - Start
+  CrawlerS3parking:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - s3
+          - parking
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl parking data in S3
+      DatabaseName: !Ref GlueDBparking
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${S3parking}'
+            Exclusions:
+              - 'tpdt_ev_rsr_raw/**'
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv ,
+        stack: parking
+        }
+# Creating Glue S3 Crawler - End
+
+# Creating Glue Jobs - Start
+  # Auto Payment related jobs - Start
+  odsAutopayMember:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_parking_autopay_member"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_parking_autopay_member'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: autopayment
+
+  odsAutopayTransaction:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_parking_autopay_transaction"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_parking_autopay_transaction'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: autopayment
+
+  odsAutopayLog:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_parking_autopay_log"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_parking_autopay_log'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: autopayment
+  # Auto Payment related jobs - End
+
+  # Parking related jobs - Start
+  dwParkerIdentity:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_parker_identity"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_parker_identity'
+      NumberOfWorkers: 6
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  odsVehicles:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_vehicles"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_vehicles'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  odsEventLog:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ods_carpark_user_event_log"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ods_carpark_user_event_log'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  dwParkingInvoice:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_parking_invoice"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_parking_invoice'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  dwParkingEntry:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_parking_entry"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_parking_entry'
+      NumberOfWorkers: 6
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  dwParkingRedemption:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_dw_parking_redemption"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_dw_parking_redemption'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  AdobeBindingAndParking:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_adobe_binding_and_parking"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: 3.0
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_adobe_binding_and_parking'
+      NumberOfWorkers: !Ref GluejobNumberOfWorkers
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: adobe
+
+  dailyCulmulation:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_parking_daily_culmulation"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_parking_daily_culmulation'
+      NumberOfWorkers: 4
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  evCharging:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_evcharging"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_evcharging'
+      NumberOfWorkers: 4
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  evChargingFullLoad:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ev_rsr_raw_full_load"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ev_rsr_raw_full_load'
+      NumberOfWorkers: 4
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  evChargingFinal:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ev_rsr_raw_final"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ev_rsr_raw_final'
+      NumberOfWorkers: 4
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  evChargingETL:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ev_rsr_raw_etl"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ev_rsr_raw_etl'
+      NumberOfWorkers: 4
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  # Parking related jobs - End
+# Creating Glue Jobs - Start
+
+# Creating Glue Workflow - Start
+  # Parking Related Workflow - Start
+  ParkingGlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - parking
+          - turncate
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+  # Parking Related Workflow - End
+# Creating Glue Workflow - End
+
+# Creating Glue Trigger - Start
+  # Parking Related Trigger - Start
+  ParkingGlueTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref odsAutopayMember
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - parking
+          - turncate
+          - schedule
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "SCHEDULED"
+      Schedule: cron(50 21 * * ? *)
+      StartOnCreation: true
+      WorkflowName: !Ref ParkingGlueWorkflow
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: autopay
+
+  odsAutopayTransactionTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - odsAutopayTransaction
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref odsAutopayTransaction
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsAutopayMember
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: autopay
+
+  odsAutopayLogTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - odsAutopayLog
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref odsAutopayLog
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsAutopayTransaction
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: autopay
+
+  VehiclesGlueTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - vehicles
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref odsVehicles
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsAutopayLog
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  EventLogGlueTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - event
+          - log
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref odsEventLog
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsVehicles
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+
+  EvChargingTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - evcharging
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref evCharging
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref odsEventLog
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: ev
+
+  evChargingFinalTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - evChargingFinal
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref evChargingFinal
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref evCharging
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: ev
+
+  evChargingETLTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - evChargingETL
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref evChargingETL
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref evChargingFinal
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: ev
+
+  dwParkingEntryTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - dwParkingEntry
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref dwParkingEntry
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref evChargingETL
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  dwParkingInvoiceTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - dwParkingInvoice
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref dwParkingInvoice
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwParkingEntry
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  dwParkingRedemptionTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - dwParkingRedemption
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref dwParkingRedemption
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwParkingInvoice
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  ParkerGlueTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - parkeridentity
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref dwParkerIdentity
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwParkingRedemption
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  DailyCulmulationGlueTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - daily
+          - culmulation
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref dailyCulmulation
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dwParkerIdentity
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  s3ParkingCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - CrawlerName: !Ref CrawlerS3parking
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - parking
+          - crawler
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref dailyCulmulation
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: parking
+
+  AdobeBindingAndParkingTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - adobe
+          - binding
+          - and
+          - parking
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref ParkingGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref AdobeBindingAndParking
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref CrawlerS3parking
+            CrawlState: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: parking
+        BusinessFunction: adobe
+
+  # Parking Related Trigger - End
+# Creating Glue Trigger- End
+
+# Creating Lambda Function - Start
+  CarparkDataCleaning:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: To find missed data in carpark_data_bi
+      FunctionName: !Sub '${AWSTeam}-carpark-data-cleaning'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/carpark_data_cleaning.zip
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-09008dc3534447e51
+        SubnetIds:
+          - subnet-0406aa5bbf9d46605
+          - subnet-0768b1e8f3bd1a45b
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: parking
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pysftp:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_SQLAlchemy:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pymysql:1'
+
+  carparkGsheets:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: To insert gsheet data to athena
+      FunctionName: !Sub '${AWSTeam}-carpark-gsheets'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/carpark_gsheets.zip
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: parking
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_google_auth:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_gspread:1'
+
+  CarparkDataIngestion:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Extract carpark data from SFTP to DB02
+      FunctionName: !Sub '${AWSTeam}-carpark-data-ingestion'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/carpark_data_ingestion.zip
+      Timeout: 900
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      ReservedConcurrentExecutions: 1
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-09008dc3534447e51
+        SubnetIds:
+          - subnet-0406aa5bbf9d46605
+          - subnet-0768b1e8f3bd1a45b
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: parking
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pysftp:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_SQLAlchemy:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pymysql:1'
+
+# Creating Lambda Function - End
+
+  CarparkDataCleaningScheduleEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: "cron(30 13 * * ? *)"
+      State: "ENABLED"
+      Name: !Sub '${AWSTeam}-lambda-CarparkDataCleaning'
+      Targets:
+        - Arn: !GetAtt CarparkDataCleaning.Arn
+          Id: 'CarparkDataCleaning'
+          Input: !Sub '{"env": "${AWSEnv}"}'
+        - Arn: !GetAtt carparkGsheets.Arn
+          Id: 'abnormal_spender_confirmed_by_mall'
+          Input: '{"gsheet_url": "https://docs.google.com/spreadsheets/d/1fTZE9UliSq8G4SfX1VSQsrArlQNybc3SGzpsXn6IEDk/edit#gid=0","columns_renaming": {"Sent Date":"Sent_Date", "Reply Date": "Reply_Date", "Member ID": "Member_ID", "Confirmed by which Mall":"Confirmed_by_which_Mall", "Shop":"Shop", "normal spender / abnormal spender / parallel trader / shop staff":"spender_type", "Remarks": "Remarks"},"worksheet": "sheet1","bucket_to_save": "tpdt-adhoc","path_name": "abnormal_spender_confirmed_by_mall/abnormal_spender_confirmed_by_mall.csv"}'
+        - Arn: !GetAtt carparkGsheets.Arn
+          Id: 'abnormal_receipt'
+          Input: '{"gsheet_url": "https://docs.google.com/spreadsheets/d/1izv_pgBGsvQzMjDftJUnati9yA4QWDhd8I8euz0NWsU/edit#gid=0","columns_renaming": {"type":"type", "value": "value", "reply_date": "reply_date", "reply_mall":"reply_mall"},"worksheet": "abnormal receipt","bucket_to_save": "tpdt-adhoc","path_name": "abnormal_receipt/abnormal_receipt.csv"}'
+
+  CarparkDataIngestionScheduleEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: "cron(15 22 * * ? *)"
+      State: "ENABLED"
+      Name: !Sub '${AWSTeam}-lambda-CarparkDataIngestion'
+      Targets:
+        - Arn: !GetAtt CarparkDataIngestion.Arn
+          Id: 'CarparkDataIngestion'
+          Input: !Sub '{"env": "${AWSEnv}"}'
+
+  CarparkDataCleaningPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CarparkDataCleaning
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CarparkDataCleaningScheduleEvent.Arn
+
+  carparkGsheetsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref carparkGsheets
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CarparkDataCleaningScheduleEvent.Arn
+
+  CarparkDataIngestionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CarparkDataIngestion
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CarparkDataIngestionScheduleEvent.Arn

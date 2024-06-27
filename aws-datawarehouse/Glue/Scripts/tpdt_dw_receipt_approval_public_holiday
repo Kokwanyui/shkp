@@ -1,0 +1,92 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import date
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-staging/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-staging-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+today = date.today()
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : master_data
+t_master_data = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'master_data', transformation_ctx = "receipt")
+master_data_df = t_master_data.toDF()\
+                              .select('tag')\
+                              .filter("type = 12")\
+                              .filter("status = 'A'")\
+                              .filter("tag >= '2019-01-01'")
+master_data_df.createOrReplaceTempView("master_data")
+print("Source Extraction Finished: master_data...")
+
+##source table : spending
+t_spending= glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "spending")
+spending_df = t_spending.toDF().select('receipt_id', 'receipt_upload_date', 'approve_or_reject_date')\
+                               .withColumn('adj_approve_or_reject_date', when(col('approve_or_reject_date').isNotNull(), col('approve_or_reject_date')).otherwise(today))
+spending_df.createOrReplaceTempView("spending")
+print("Source Extraxtion Finished: spending...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+print("Perform data transformation...")
+
+tmp_df = master_data_df.withColumn('day',dayofweek(col('tag'))).distinct()
+tmp_df = tmp_df.where("day not in (1,7)")
+tmp_df.createOrReplaceTempView("tmp_df")
+
+receipt_approval_public_holiday = spark.sql("""
+Select distinct receipt_id, count(distinct tag) as no_of_ph
+from spending t1
+left join tmp_df t2 on t2.tag between t1.receipt_upload_date and t1.adj_approve_or_reject_date
+group by receipt_id
+""")
+
+receipt_approval_public_holiday.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+print(df)

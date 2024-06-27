@@ -1,0 +1,48 @@
+ adobePushNote:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_adobe_push_note"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_adobe_push_note'
+      NumberOfWorkers: 2
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: adobe
+        BusinessFunction: adobe
+
+           - LogicalOperator: EQUALS
+            JobName: !Ref adobePushNote
+            State: SUCCEEDED
+
+
+       VpcConfig:
+        SecurityGroupIds:
+          - sg-0f4ca243e533fb8e4
+        SubnetIds:
+          - subnet-04d33e26554a30299
+          - subnet-0c96b90ab50acebba

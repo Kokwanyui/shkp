@@ -1,0 +1,134 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.window import Window
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+#spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03parking="tpdt_03parking"
+    db03stamp="tpdt_03stampmission"
+    db03sub="tpdt_03sub"
+    output_path="s3://shkpcdp-thepoint-input/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://"+env+"shkpcdp-thepoint-input/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+bi_prefix = 'bi_datamart_'
+dimension_prefix = 'bi_dimension_'
+suffix = datetime.now().astimezone(timezone(timedelta(hours=8))).strftime("%Y%m%d%H%M%S")
+
+
+## udfs
+def save_df(df, separator, root_folder):
+    # clean all objects in folder
+    s3 = boto3.resource('s3')
+    clean_bucket = s3.Bucket('shkpcdp-thepoint-input')
+    clean_prefix = f'{root_folder}/input/'
+    clean_bucket.objects.filter(Prefix=clean_prefix).delete()
+    
+    # save temp file
+    output_path = f"s3://shkpcdp-thepoint-input/{root_folder}/input/temp"
+    df.coalesce(1).write.mode("overwrite").option("timestampFormat", "yyyy-MM-dd HH:mm:ss").option("dateFormat", "yyyy-MM-dd").option("compression", "gzip").csv(output_path, header="true", sep=separator)
+
+
+def renaming_output(root_folder, cdp_tablename):
+    # renaming config
+    s3 = boto3.client('s3')
+    BucketName = 'shkpcdp-thepoint-input'
+    FolderName = f'{root_folder}/input/temp/'
+    FinalFolder = f'{root_folder}/input/'
+    
+    NewFile = f'{FinalFolder}{cdp_tablename}_{suffix}.csv.gz'
+    response = s3.list_objects(
+        Bucket= BucketName,
+        MaxKeys = 2,
+        Prefix=FolderName
+        )
+    OldFile=response['Contents'][0]['Key']
+    OldSource=BucketName + '/' +   OldFile
+    
+    # move file and rename
+    rename_file = boto3.resource('s3')
+    rename_file.Object(BucketName,NewFile).copy_from(CopySource=OldSource)
+    rename_file.Object(BucketName,OldFile).delete()
+    
+
+##source table : cleaned_dw_spending-----------------
+t_spending_raw = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "spending_raw")
+spending_df = t_spending_raw.toDF()\
+                            .withColumn('is_staff', when(col('registration_date') < to_date(to_timestamp(lit('2019-03-12 00:00:00') , "yyyy-MM-dd HH:mm:ss")), lit(1)).otherwise(lit(0)))\
+                            .withColumn('receipt_transaction_date_origin', col('receipt_transaction_date'))\
+                            .withColumn('receipt_upload_datetime_before_launch', lit(0) )\
+                            .withColumnRenamed('member_tier', 'membership_tier')\
+                            .filter("receipt_status_detail = 'Approved'")\
+                            .filter("receipt_upload_datetime >= '2019-03-12 14:00:00'")\
+                            .filter("receipt_transaction_date >= '2019-03-12'")\
+                            .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification', 'Marked For Deletion')")\
+                            .filter("Team not in ('Partner')")\
+                            .filter("Abnormal_case = 0")\
+                            .filter("year(receipt_upload_date) < 2022")
+s3_folder = 'spending_before_2022'
+sep_by = ';'
+cdp_table_name = 'dm_spending_before_2022'
+save_df(spending_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+t_spending_raw = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "spending_raw")
+spending_df = t_spending_raw.toDF()\
+                            .withColumn('is_staff', when(col('registration_date') < to_date(to_timestamp(lit('2019-03-12 00:00:00') , "yyyy-MM-dd HH:mm:ss")), lit(1)).otherwise(lit(0)))\
+                            .withColumn('receipt_transaction_date_origin', col('receipt_transaction_date'))\
+                            .withColumn('receipt_upload_datetime_before_launch', lit(0) )\
+                            .withColumnRenamed('member_tier', 'membership_tier')\
+                            .filter("receipt_status_detail = 'Approved'")\
+                            .filter("receipt_upload_datetime >= '2019-03-12 14:00:00'")\
+                            .filter("receipt_transaction_date >= '2019-03-12'")\
+                            .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification', 'Marked For Deletion')")\
+                            .filter("Team not in ('Partner')")\
+                            .filter("Abnormal_case = 0")\
+                            .filter("year(receipt_upload_date) >= 2022")
+s3_folder = 'spending'
+sep_by = ';'
+cdp_table_name = 'dm_spending_2022_or_after'
+save_df(spending_df, sep_by , s3_folder)
+renaming_output(s3_folder, cdp_table_name)
+
+

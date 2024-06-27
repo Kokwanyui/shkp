@@ -1,0 +1,53 @@
+
+  # Creating Lambda Function - Start
+  yataOverlap:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Get Yata Overlap Member from CDP
+      FunctionName: !Sub '${AWSTeam}-yata-overlap-member'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/yata_overlap.zip
+      Timeout: 300
+      Environment:
+        Variables:
+          secret_name: tpdt_cdp_accesstoken
+          cdp_bucket: shkpcdp-thepoint
+          cdp_prefix: YATA_Overlap/YATA_and_The_Point_Overlap_Summary
+          tpdt_bucket: tpdt-data-from-cdp
+          tpdt_location: yata_overlap/yata_overlap_member_id.csv
+      ReservedConcurrentExecutions: 1
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: cdp
+      TracingConfig:
+        Mode: Active
+
+  YataOverlapScheduleEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: "cron(30 13 * * ? *)"
+      State: "ENABLED"
+      Name: !Sub '${AWSTeam}-lambda-yataoverlap'
+      Targets:
+        - Arn: !GetAtt yataOverlap.Arn
+          Id: 'YataOverlapSchedule'
+          Input: !Sub '{"env": "${AWSEnv}"}'
+
+
+  YataOverlapPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref yataOverlap
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt YataOverlapScheduleEvent.Arn
+  # Creating Lambda Function - End

@@ -1,0 +1,32 @@
+A. Processes to update LMS data
+1) Ask RMCR for lms data by email (around monthly 7-9th), 2 excel files will be received:
+    i. `Retail Sales.xlsx`
+    ii. `Mapping Table.xlsx`
+2) Update 02.bi_dimension.dim_retail_sales_from_lms with `Retail Sales.xlsx` & script: MYSQL/lms/dim_retail_sales_from_lms.sql
+3) Cleaning Data in `Mapping Table.xlsx`
+4) Update 02.bi_dimension.dim_retail_sales_from_lms with Process 3 result &
+5) Manually start Glue Job `tpdt_lms_retail_sales`
+
+
+B. Working Folders
+ - `Retail Sales.xlsx`: \\shknapsvm03\lrmcr\Common\RMCR\Analytics Team\Project\LMS record\Reatil Sales Record
+
+
+C. Process Detail
+Process 1:
+`Retail Sales.xlsx` contain 3 months lms sales from shops.
+Usually, there is T-2 months data. ie. you receive March 2022 LMS sales in May 2022 email.
+It is because shops take 1 month to handle sales data and send back to us.
+Sometimes, a few shops may not hand in sales data in time and, therefore, we need to delete last 2 months records and insert updated data again
+
+Process 2:
+
+Process 3:
+i. Create New Excel
+ii. Copy Mapping tab from past excel
+iii. Copy `Mapping Table.xlsx` to `from RMCR` tab
+iv. first cleaning:
+    - Ctrl + F: Replace '(blank)' with '' to all columns
+    - Ctrl + F: Replace "'" with "^" to column C to G
+v. copy 02.bi_dimension.dim_lms_mapping to tab `past records`
+vi. refresh formula in column S to Z

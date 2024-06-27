@@ -1,0 +1,38 @@
+# sync all Glue scripts from prod S3 to local
+aws s3 sync s3://tpdt-artifacts/Glue/Scripts/ C:\Users\steveko\PycharmProjects\untitled\venv\aws-datawarehouse\Glue\Scripts --exclude "*.temp" --profile prod-runner --region ap-east-1
+
+
+# download python library in dev ec2 and send to s3, putty login 'centos'
+aws
+mkdir python
+python3.7 -m pip install <your library> -t python
+zip -r <your library>.zip python
+cp ./<your library>.zip ./lambda_layer/<your library>.zip
+rm ./<your library>.zip 
+cd lambda_layer
+aws s3 sync . s3://tpdt-artifacts/Lambda/Layers/ --profile prod-runner --region ap-east-1
+aws s3 sync s3://tpdt-artifacts/Lambda/Layers/ C:\Users\steveko\PycharmProjects\untitled\venv\aws-datawarehouse\Lambda\Layers --profile prod-runner --region ap-east-1
+
+# Update Lambda Function Code
+aws lambda update-function-code --function-name tpdt-auto-report-sns-publish --s3-bucket tpdt-artifacts --s3-key Lambda/Functions/auto_report_sns_publish.zip --profile prod-runner --region ap-east-1
+
+# Invoke Lambda Code
+aws lambda invoke --function-name tpdt-ga4-bigquery-data-extraction-full-load --cli-binary-format raw-in-base64-out --payload '{"env":"prod"}' --profile prod-runner --region ap-east-1 response.json
+
+# Delete Lambda Layer Code
+aws lambda delete-layer-version --layer-name tpdt_mysql_connector_python_rf --version-number 1 --profile prod-runner --region ap-east-1
+
+
+# Add Lambda Permission Code
+aws lambda add-permission --function-name tpdt_ga4_testing_uat --statement-id tpdt_tpdt_ga4_testing_uat --action 'lambda:InvokeFunction' --principal events.amazonaws.com --source-arn arn:aws:events:ap-east-1:581813634934:rule/tpdt_tpdt_ga4_testing_uat --profile situat-runner --region ap-east-1
+
+# Tag EventBridge Resources
+aws events tag-resource --resource-arn arn:aws:events:ap-east-1:244353132907:rule/tpdt-lambda-CarparkDataCleaning --tags [{\"Key\":\"application\",\"Value\":\"tpdt\"},{\"Key\":\"environment\",\"Value\":\"prod\"}]
+
+aws events tag-resource --resource-arn arn:aws:events:ap-east-1:244353132907:rule/tpdt-lambda-GA4BigQueryDataExtraction --tags Key=environment,Value=prod --profile prod-runner --region ap-east-1
+
+# create secretsmanager
+aws secretsmanager create-secret --name tpdt_03redshift --secret-string "{\"username\":\"sample\"}" --tags [{\"Key\":\"application\",\"Value\":\"tpdt\"},{\"Key\":\"environment\",\"Value\":\"prod\"}] --profile prod-runner --region ap-east-1
+
+# sync all lambda code
+aws s3 sync s3://tpdt-artifacts/Lambda/Functions/ C:\Users\steveko\PycharmProjects\untitled\venv\aws-datawarehouse\Lambda\Functions --profile prod-runner --region ap-east-1

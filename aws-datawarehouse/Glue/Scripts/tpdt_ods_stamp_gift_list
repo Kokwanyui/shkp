@@ -1,0 +1,87 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import col,from_json, regexp_replace, json_tuple, expr, explode
+import pandas as pd
+import numpy as np
+import json
+
+
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+db01="tpdt_01replica_"+env
+prefix="shkpmalls_stamp_"
+output_path="s3://tpdt-staging-"+env+"/"+table_name
+
+#spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : stamp_card
+t_stamp_card  = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'stamp_card', transformation_ctx = "stamp_card")
+stamp_card_df = t_stamp_card.toDF()\
+                            .select(col('ID').alias('stamp_program_id'),
+                                    col('gift_tier_str').alias('gift_list'),
+                                    'gift_stamp_required_str',
+                                    'gift_requires_approval_str')\
+                            .toPandas()
+print("Source Extraxtion Finished: stamp_card...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+rows = len(stamp_card_df)
+con_list = []
+for r in range(rows):
+    for index, sub_item in enumerate(stamp_card_df['gift_list'][r].split(':')):
+        partial_list = [str(stamp_card_df['stamp_program_id'][r])]
+        gift_item = sub_item.split('|@|')[1]
+        if gift_item[0].isalpha():
+            partial_list.append(gift_item)
+        else:
+            partial_list.append('')
+        if gift_item[0].isalpha():
+            partial_list.append('')
+        else:
+            partial_list.append(gift_item)
+        partial_list.append(stamp_card_df['gift_stamp_required_str'][r].split(':')[index])
+        partial_list.append(stamp_card_df['gift_requires_approval_str'][r].split(':')[index])
+        con_list.append(partial_list)
+
+list_title = ['stamp_program_id', 'isPhysicalGift', 'isPoint', 'stampRequire','approvalRequire']
+gift_list = pd.DataFrame(np.array(con_list), columns=list_title)
+gift_list = spark.createDataFrame(gift_list)
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+gift_list.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+print(f"Result Saved in {output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+

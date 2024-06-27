@@ -1,0 +1,83 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-parking/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-parking-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+prefix="shkpmalls_carpark_"
+
+
+## Source Extraction
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_vip_member', transformation_ctx = "member")
+member_df = t_member.toDF().select(col('member_id').alias('memberId')).filter("status = 'V'")
+member_df.createOrReplaceTempView("member")
+print("Source Extraction Finished: Member...")
+
+
+##source table : device_info
+t_vehicles = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'vehicles', transformation_ctx = "vehicles")
+vehicles_df = t_vehicles.toDF().select(trim(col('lpn')).alias('lpn'),
+                                       'validationSts',
+                                       col('memberId').alias('Member_id'),
+                                       'cardType'
+                                       )
+print("Source Extraxtion Finished: vehicles...")
+
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+
+vehicles_df_final = vehicles_df.join(member_df, upper(vehicles_df.Member_id) == upper(member_df.memberId), how='left') \
+    .withColumn('lpn_final',
+                when(col('memberId').isNotNull() & col('lpn').isNotNull(), sha2(upper(col('lpn')), 256)).otherwise(col('lpn'))) \
+    .select(col('lpn_final').alias('lpn'),
+            'validationSts',
+            'Member_id',
+            'cardType')
+vehicles_df_final.createOrReplaceTempView("vehicles_df_final")
+
+
+## Loading Result to S3
+print("Saving Result into target destination...")
+vehicles_df_final.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+job.commit()

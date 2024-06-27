@@ -1,0 +1,74 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import col,from_json, regexp_replace, json_tuple, expr, explode
+import pandas as pd
+import numpy as np
+import json
+
+
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+db01="tpdt_01replica_"+env
+prefix="shkpmalls_stamp_"
+output_path="s3://tpdt-staging-"+env+"/"+table_name
+
+#spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table :  stampcard_shoplist
+t_stampcard_shoplist  = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'stampcard_shoplist', transformation_ctx = "stampcard_shoplist")
+stampcard_shoplist_df = t_stampcard_shoplist.toDF().select(col('cardid').alias('stamp_program_id'), 'shopid', 'shopname_en').toPandas()
+print("Source Extraxtion Finished: stampcard_shoplist...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+rows = len(stampcard_shoplist_df)
+con_list = []
+
+for r in range(rows):
+    partial_list = [stampcard_shoplist_df['stamp_program_id'][r]]
+    partial_list.append(stampcard_shoplist_df['shopid'][r].split('-')[0])
+    partial_list.append(stampcard_shoplist_df['shopid'][r].split('-')[1])
+    partial_list.append(stampcard_shoplist_df['shopname_en'][r])
+    con_list.append(partial_list)
+
+list_title = ['stamp_program_id', 'mallid', 'shopid', 'shopname_en']
+shop_list = pd.DataFrame(np.array(con_list), columns=list_title)
+
+ods_stamp_shop_list = spark.createDataFrame(shop_list)
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+ods_stamp_shop_list.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+print(f"Result Saved in {output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+

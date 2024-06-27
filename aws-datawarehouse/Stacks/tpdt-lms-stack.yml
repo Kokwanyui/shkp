@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Stack to deploy resources and tasks for lms
+
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  DBprefix:
+    Type: String
+    Default: tp03
+  GlueIamRole:
+    Type: String
+  GlueVersion:
+    Type: String
+  GlueDBdw:
+    Type: String
+  GlueDB01replica:
+    Type: String
+  S3ArtifactBucket:
+    Type: String
+  GluejobNumberOfWorkers:
+    Type: Number
+    Description: number of workers for Glue Job
+  S3NameGlueTemporary:
+    Type: String
+  GlueConnector01replica:
+    Type: String
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+
+Resources:
+# Creating S3 Buckets - Start
+  S3lms:
+    Description: bucket to store all lms sales data
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - lms
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: lms
+# Creating S3 Buckets - End
+
+# Creating Glue DataBase - Start
+  GlueDB03lms:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database to connect lms bucket
+        Name: !Join
+          - '_'
+          - - !Ref AWSTeam
+            - 03lms
+            - !If
+              - IsNotPrd
+              - !Ref AWSEnv
+              - !Ref 'AWS::NoValue'
+# Creating Glue DataBase - End
+
+# Creating Glue S3 Crawler - Start
+  CrawlerS3lms:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - s3
+          - lms
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl lms sales data in S3
+      DatabaseName: !Ref GlueDB03lms
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${S3lms}'
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv ,
+        stack: lms
+      }
+# Creating Glue S3 Crawler - Start
+
+# Creating Glue Jobs - Start
+  # LMS related jobs - Start
+  lmsRetailSales:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_lms_retail_sales"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_lms_retail_sales'
+      NumberOfWorkers: 10
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: lms
+        BusinessFunction: lms
+  # LMS related jobs - End
+# Creating Glue Jobs - End

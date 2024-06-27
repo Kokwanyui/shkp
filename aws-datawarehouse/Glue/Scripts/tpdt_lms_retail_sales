@@ -1,0 +1,358 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-lms/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    lms_path="s3://tpdt-lms/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-lms-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    lms_path="s3://tpdt-lms-"+env+"/"
+
+dimension_prefix = "bi_dimension_"
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : lms_retail_sales
+lms_sales_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_retail_sales_from_lms', transformation_ctx = "lms_sales")
+lms_sales_df = lms_sales_df.toDF()
+print("Source Extraxtion Finished: lms_retail_sales...")
+
+
+##source table : dim_lms_mapping
+dim_lms_mapping_df = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_lms_mapping', transformation_ctx = "dim_lms_mapping")
+dim_lms_mapping_df = dim_lms_mapping_df.toDF()\
+                                       .withColumn('lms_trade_cat', when(col('Standard_Trade_Category')=='#N/A', 'UNDEFINABLE')\
+                                                             .when(col('Standard_Trade_Category')=='', 'UNDEFINABLE')\
+                                                             .when(col('Standard_Trade_Category')=='To Be Confirmed', 'UNDEFINABLE')\
+                                                             .when(col('Standard_Trade_Category')=='None', 'UNDEFINABLE')\
+                                                             .otherwise(col('Standard_Trade_Category')))\
+                                       .withColumn('lms_brand_name', when(col('Standard_Brand_Name_Eng')=='#N/A', 'UNDEFINABLE')\
+                                                             .when(col('Standard_Brand_Name_Eng')=='', 'UNDEFINABLE')\
+                                                             .when(col('Standard_Brand_Name_Eng')=='To Be Confirmed', 'UNDEFINABLE')\
+                                                             .when(col('Standard_Brand_Name_Eng')=='None', 'UNDEFINABLE')\
+                                                             .otherwise(col('Standard_Brand_Name_Eng')))
+print("Source Extraxtion Finished: dim_lms_mapping...")
+
+
+##source table : dim_pre_shoot_coupon
+t_dim_pre_shoot_coupon = glueContext.create_dynamic_frame.from_catalog(database=db03sub, table_name=prefix03 + 'dim_pre_shoot_coupon', transformation_ctx="dim_pre_shoot_coupon")
+dim_pre_shoot_coupon_df = t_dim_pre_shoot_coupon.toDF().select(col('receipt_id').alias('pre_shoot_coupon_receipt_id')).distinct()
+print("Source Extraxtion Finished: dim_pre_shoot_coupon...")
+
+
+##source table : abnormal_shop_for_spending
+t_abnormal_shop_for_spending = glueContext.create_dynamic_frame.from_catalog(database=db03sub, table_name=prefix03 + 'abnormal_shop_for_spending', transformation_ctx="abnormal_shop_for_spending")
+abnormal_shop_for_spending_df = t_abnormal_shop_for_spending.toDF().select(col('shop_id').alias('abnormal_shop_id')).distinct()
+print("Source Extraxtion Finished: abnormal_shop_for_spending...")
+
+
+##source table : dw_spending
+t_spending_raw = glueContext.create_dynamic_frame.from_catalog(database=db03, table_name=prefix03 + 'dw_spending', transformation_ctx="spending_raw")
+spending_df_raw = t_spending_raw.toDF()\
+                                .filter("receipt_status_detail = 'Approved'") \
+                                .filter("receipt_upload_datetime >= '2019-03-12 14:00:00'") \
+                                .filter("receipt_transaction_date >= '2019-03-12'") \
+                                .filter("member_status_detail not in ('Suspended', 'Invalid', 'Waiting for verification', 'Marked For Deletion')") \
+                                .filter("Team not in ('Partner')") \
+                                .filter("Abnormal_case = 0") \
+                                .filter("receipt_amount != 0")
+
+spending_df_final = spending_df_raw.join(dim_pre_shoot_coupon_df, spending_df_raw.receipt_id == dim_pre_shoot_coupon_df.pre_shoot_coupon_receipt_id, how='left')\
+                             .join(abnormal_shop_for_spending_df, spending_df_raw.shop_id == abnormal_shop_for_spending_df.abnormal_shop_id, how='left')\
+                             .filter("pre_shoot_coupon_receipt_id is null").filter("abnormal_shop_id is null or (abnormal_shop_id is not null and platform = 'api')")\
+                             .drop(col('pre_shoot_coupon_receipt_id')).drop(col('abnormal_shop_id'))
+
+
+spending_df = spending_df_final.select('receipt_transaction_date', col('team').alias('spending_team'), col('property_id').alias('spending_property_id'), 'lms_standard_trade_category', 'lms_standard_brand_name', 'receipt_amount')\
+                               .withColumn('spending_trade_cat', when(col('lms_standard_trade_category')=='#N/A', 'UNDEFINABLE')\
+                                                                 .when(col('lms_standard_trade_category')=='', 'UNDEFINABLE')\
+                                                                 .when(col('lms_standard_trade_category')=='To Be Confirmed', 'UNDEFINABLE')\
+                                                                 .otherwise(col('lms_standard_trade_category')))\
+                               .withColumn('spending_brand_name', when(col('lms_standard_brand_name')=='#N/A', 'UNDEFINABLE')\
+                                                                 .when(col('lms_standard_brand_name')=='', 'UNDEFINABLE')\
+                                                                 .when(col('lms_standard_brand_name')=='To Be Confirmed', 'UNDEFINABLE')\
+                                                                 .otherwise(col('lms_standard_brand_name')))
+print("Source Extraxtion Finished: dw_spending...")
+
+
+##source table : _dim_tp_mall_mapping
+t_dim_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_mall_mapping', transformation_ctx = "dim_mall_mapping")
+dim_mall_mapping_df = t_dim_mall_mapping.toDF().select(col('property_id').alias('mapping_property_id'), col('team').alias('Team'))
+print("Source Extraxtion Finished: dim_tp_mall_mapping...")
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Mall Mapping
+mall_mapping = {
+    'APM-MILLENNIUM CITY 5':              'APM',
+    'CENTRAL HEIGHTS':                    'CH',
+    'EAST POINT CITY':                    'EPC',
+    'LANDMARK NORTH':                     'LN',
+    'METROPLAZA':                         'MP',
+    'MIKIKI':                             'MKK',
+    'MOKO':                               'MOKO',
+    'NEW TOWN PLAZA PHASE I':             'NTP',
+    'NEW TOWN PLAZA PHASE III':           'NTP',
+    'PARK CENTRAL':                       'PC',
+    'PARK CENTRAL (PHASE 2 TKO 66)':      'PC',
+    'TAI PO MEGA MALL':                   'TPMM',
+    'THE WORLD TRADE CENTRE':             'WTC',
+    'TSUEN WAN PLAZA':                    'TWP',
+    'V CITY':                             'VCY',
+    'YOHO MALL I':                        'YM',
+    'YOHO MALL II':                       'YM',
+    'YUEN LONG PLAZA':                    'YLP',
+    'V Walk':                             'VWK',
+    'HARBOUR NORTH - EASTERN SITE':       'HN',
+    'HARBOUR NORTH - HOTEL SITE':         'HN',
+    'METROPOLIS PLAZA':                   'MPP',
+    'HARBOUR NORTH - WESTERN SITE':       'HN',
+    'HARBOUR NORTH - PHASE 1':            'HN',
+    'HARBOUR NORTH - PHASE 2':            'HN',
+    'HARBOUR NORTH - PHASE 3':            'HN',
+    'HOMESQUARE':                         'HS',
+    'K-POINT':                            'KP',
+    'UPTOWN PLAZA':                       'UP',
+    'CHELSEA HEIGHTS PHASE II':           'CH',
+    'PopWalk':                            'PW',
+    'PopWalk 2':                          'PW',
+    'PopWalk 3':                          'PW',
+    'TSUEN KAM CENTRE':                   'TKC',
+    'Ocean PopWalk':                      'PW',
+    'CHI FU LANDMARK':                    'CFLM',
+    'NEW JADE SHOPPING ARCADE':           'NJSA',
+    'GRAND CITY PLAZA (SHOPPING ARCADE)': 'TKC'
+    }
+
+# Mall Joining Date
+mall_joining_yearmonth = {
+    'HN':   201910,
+    'MPP':  201910,
+    'UP':   202003,
+    'HS':   202003,
+    'KP':   202004,
+    'NJSA': 202112,
+    'CFLM': 202201,
+    'PW':   202009,
+    'CH':   202009,
+    'TKC':  202103
+    }
+
+
+# cleaning data on lms data
+lms_sales_df2 = lms_sales_df.filter("AGREEMENT_NO not in ('D62877','D61997','D84133')").filter("Month != 201903")  # exclude Apple agreement number
+mall_mapping_df = spark.createDataFrame(mall_mapping.items(), schema=StructType(fields=[StructField("lms_mall_name", StringType()), StructField("mapping_df_property_id", StringType())]))
+mall_joining_df = spark.createDataFrame(mall_joining_yearmonth.items(), schema=StructType(fields=[StructField("mapping_mall", StringType()), StructField("joining_yearmonth", StringType())]))
+mall_joining_df.createOrReplaceTempView("mall_joining_df")
+
+retail_sales_perc_raw1 = lms_sales_df2.join(dim_lms_mapping_df, lms_sales_df2.agreement_no == dim_lms_mapping_df.Agreement_No, how='left')\
+                                      .join(mall_mapping_df, lms_sales_df2.mall == mall_mapping_df.lms_mall_name, how='left')\
+                                      .withColumn("lms_trade_cat", when(col("lms_trade_cat").isNotNull(), col("lms_trade_cat")).otherwise("UNDEFINABLE"))\
+                                      .withColumn("lms_brand_name", when(col("lms_brand_name").isNotNull(), col("lms_brand_name")).otherwise("UNDEFINABLE"))
+
+retail_sales_perc_raw1 = retail_sales_perc_raw1.join(dim_mall_mapping_df, dim_mall_mapping_df.mapping_property_id == retail_sales_perc_raw1.mapping_df_property_id, how='left')
+
+
+# lms_aggregate_raw
+retail_sales_by_brand_raw = retail_sales_perc_raw1.groupBy('Team', 'Month', 'mapping_property_id', 'lms_trade_cat', 'lms_brand_name').agg(sum('lms_sales').alias('lms_sales'))
+retail_sales_by_brand_raw.createOrReplaceTempView("retail_sales_by_brand_raw")
+
+
+# spending_aggregate_raw
+brand_spending = spending_df.groupBy(date_format(col('receipt_transaction_date'), "yyyyMM").alias('receipt_transaction_yearmonth'), 'spending_team', 'spending_property_id', 'spending_trade_cat', 'spending_brand_name').agg(sum('receipt_amount').alias('member_spend'))
+brand_spending.createOrReplaceTempView("brand_spending")
+
+
+# undefinable brand checking
+by_brand_checking = spark.sql("""
+    Select
+        t2.Team as team,
+        t2.Month as month,
+        t2.lms_trade_cat as lms_standard_trade_category,
+        t2.lms_brand_name as lms_standard_brand_name,
+        0 as member_spend,
+        t2.lms_sales,
+        concat(t2.Month,'01') as sales_date,
+        t2.mapping_property_id as property_id
+	from retail_sales_by_brand_raw t2
+	left join brand_spending t1
+	on t1.receipt_transaction_yearmonth = t2.Month
+	and t1.spending_property_id = t2.mapping_property_id
+	and t1.spending_brand_name = t2.lms_brand_name
+	where t1.receipt_transaction_yearmonth is null
+
+	union all
+
+	Select
+        t1.spending_team as team,
+        t1.receipt_transaction_yearmonth as month,
+        t1.spending_trade_cat as lms_standard_trade_category,
+        t1.spending_brand_name as lms_standard_brand_name,
+        t1.member_spend,
+        0 as lms_sales,
+        concat(t1.receipt_transaction_yearmonth,'01') as sales_date,
+        t1.spending_property_id as property_id
+	from brand_spending t1
+	inner join (select distinct Month from retail_sales_by_brand_raw) t3 on t1.receipt_transaction_yearmonth = t3.Month
+	left join retail_sales_by_brand_raw t2
+	on t1.receipt_transaction_yearmonth = t2.Month
+	and t1.spending_property_id = t2.mapping_property_id
+	and t1.spending_brand_name = t2.lms_brand_name
+	where t2.Month is null
+""")
+
+
+# joining raw
+by_brand_raw = spark.sql("""
+    Select
+        t2.Team as team,
+        t2.Month as month,
+        case when t1.spending_trade_cat is not null then t1.spending_trade_cat else t2.lms_trade_cat end as lms_standard_trade_category,
+        case when t1.spending_brand_name is not null then t1.spending_brand_name else 'UNDEFINABLE' end as lms_standard_brand_name,
+        case when t1.member_spend is not null then member_spend else 0 end as member_spend,
+        t2.lms_sales,
+        concat(t2.Month,'01') as sales_date,
+        t2.mapping_property_id as property_id
+	from retail_sales_by_brand_raw t2
+	left join brand_spending t1
+	on t1.receipt_transaction_yearmonth = t2.Month
+	and t1.spending_property_id = t2.mapping_property_id
+	and t1.spending_brand_name = t2.lms_brand_name
+
+	union all
+
+	Select
+        t1.spending_team as team,
+        t1.receipt_transaction_yearmonth as month,
+        t1.spending_trade_cat as lms_standard_trade_category,
+        'UNDEFINABLE' as lms_standard_brand_name,
+        t1.member_spend,
+        0 as lms_sales,
+        concat(t1.receipt_transaction_yearmonth,'01') as sales_date,
+        t1.spending_property_id as property_id
+	from brand_spending t1
+	inner join (select distinct Month from retail_sales_by_brand_raw) t3 on t1.receipt_transaction_yearmonth = t3.Month
+	left join retail_sales_by_brand_raw t2
+	on t1.receipt_transaction_yearmonth = t2.Month
+	and t1.spending_property_id = t2.mapping_property_id
+	and t1.spending_brand_name = t2.lms_brand_name
+	where t2.Month is null
+""")
+by_brand_raw.createOrReplaceTempView("by_brand_raw")
+
+by_brand_df = spark.sql("""
+    Select
+        team,
+        cast (month as int) as month,
+        lms_standard_trade_category,
+        lms_standard_brand_name,
+        sum(member_spend) as member_spend,
+        sum(lms_sales) as lms_sales,
+        to_date(sales_date, 'yyyyMMdd') as sales_date,
+        property_id
+    from by_brand_raw t1
+    left join mall_joining_df t2 on t1.property_id = t2.mapping_mall
+    where t2.mapping_mall is null or (mapping_mall is not null and month > joining_yearmonth)
+    group by team, month, lms_standard_trade_category, lms_standard_brand_name, sales_date, property_id
+""")
+by_brand_df.createOrReplaceTempView("by_brand_df")
+
+by_trade_cat_and_mall_df = spark.sql("""
+    Select team, month, lms_standard_trade_category, sum(member_spend) as member_spend, sum(lms_sales) as lms_sales, sales_date, property_id
+    from by_brand_df t1
+    group by team, month, lms_standard_trade_category, sales_date, property_id
+""")
+
+by_mall_df = spark.sql("""
+    Select team, month, sales_date, sum(member_spend) as member_spend, sum(lms_sales) as lms_sales, property_id
+    from by_brand_df t1
+    group by team, month, sales_date, property_id
+""")
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+lms_sales_df_output_path = output_path+prefix03+'lms_raw/'
+lms_sales_df.write.format('parquet').mode('overwrite').partitionBy('Mall').option("header",True).save(lms_sales_df_output_path)
+print(f"Result Saved in {lms_sales_df_output_path}...")
+
+by_brand_df_output_path = output_path+prefix03+'lms_by_brand/'
+by_brand_df.write.format('parquet').mode('overwrite').partitionBy('property_id').option("header",True).save(by_brand_df_output_path)
+print(f"Result Saved in {by_brand_df_output_path}...")
+
+by_trade_cat_and_mall_df_output_path = output_path+prefix03+'lms_by_trade_cat_and_mall/'
+by_trade_cat_and_mall_df.write.format('parquet').mode('overwrite').partitionBy('property_id').option("header",True).save(by_trade_cat_and_mall_df_output_path)
+print(f"Result Saved in {by_trade_cat_and_mall_df_output_path}...")
+
+by_mall_df_output_path = output_path+prefix03+'lms_by_mall/'
+by_mall_df.write.format('parquet').mode('overwrite').partitionBy('property_id').option("header",True).save(by_mall_df_output_path)
+print(f"Result Saved in {by_mall_df_output_path}...")
+
+by_brand_checking_output_path = "s3://tpdt-adhoc/hailey_lms_undefinable_brand_checking/"
+by_brand_checking.write.format('parquet').mode('overwrite').partitionBy('property_id').option("header", True).save(by_brand_checking_output_path)
+print(f"Result Saved in {by_brand_checking_output_path}...")
+
+# by_brand_df_output_path = "s3://tpdt-adhoc/hailey_testing_lms_by_brand_df/"
+# by_brand_df.write.format('parquet').mode('overwrite').partitionBy('property_id').option("header",True).save(by_brand_df_output_path)
+# print(f"Result Saved in {by_brand_df_output_path}...")
+
+# by_trade_cat_and_mall_df_output_path = "s3://tpdt-adhoc/hailey_testing_lms_by_trade_cat_and_mall_df/"
+# by_trade_cat_and_mall_df.write.format('parquet').mode('overwrite').partitionBy('property_id').option("header",True).save(by_trade_cat_and_mall_df_output_path)
+# print(f"Result Saved in {by_trade_cat_and_mall_df_output_path}...")
+
+# by_mall_df_output_path = "s3://tpdt-adhoc/hailey_testing_lms_by_mall_df/"
+# by_mall_df.write.format('parquet').mode('overwrite').partitionBy('property_id').option("header",True).save(by_mall_df_output_path)
+# print(f"Result Saved in {by_mall_df_output_path}...")
+
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

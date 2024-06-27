@@ -1,0 +1,63 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import col,from_json, regexp_replace, json_tuple, expr, explode
+import pandas as pd
+import numpy as np
+import json
+
+
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+db01="tpdt_01replica_"+env
+prefix="shkpmalls_stamp_"
+output_path="s3://tpdt-staging-"+env+"/"+table_name
+
+#spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : member_stamp_record
+t_member_stamp_record  = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_stamp_record', transformation_ctx = "member_stamp_record")
+member_stamp_record_df = t_member_stamp_record.toDF()\
+                                              .filter("receipt_id <> 0")
+print("Source Extraxtion Finished: member_stamp_record...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+member_stamp_record_df = member_stamp_record_df.select(col('ID').alias('stamp_transaction_id'), 
+                                                       col('vid').alias('member_id'), 
+                                                       col('cardid').alias('stamp_program_id'), 
+                                                       'lastupdate',
+                                                       explode(split('receipt_id', '::')).alias('receipt_id'))
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Results into target destination...")
+member_stamp_record_df.write.format('parquet').mode('overwrite').partitionBy("stamp_program_id").option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+

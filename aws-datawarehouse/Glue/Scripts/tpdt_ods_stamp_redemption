@@ -1,0 +1,111 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import col,from_json, regexp_replace, json_tuple, expr, explode
+import pandas as pd
+import numpy as np
+import json
+
+
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+db01="tpdt_01replica_"+env
+prefix="shkpmalls_stamp_"
+output_path="s3://tpdt-staging-"+env+"/"+table_name
+
+#spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : redemption
+t_redemption = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'redemption', transformation_ctx = "redemption")
+redemption_df = t_redemption.toDF().select(col('vid').alias('member_id'), 
+                                            col('cardid').alias('stamp_program_id') , 
+                                            'gift_tier_str' ,
+                                            'gift_stamp_required' ,
+                                            'pickup_mall_id' , 
+                                            'gift_btn_text_en' ,
+                                            'gift_btn_text_tc' ,
+                                            'redeem_status', 
+                                            'redeem_date',
+                                            'recordtime' ,
+                                            'lastupdatetime' ,
+                                            'gift_1_trans_id').toPandas()
+print("Source Extraxtion Finished: redemption...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+rows = len(redemption_df)
+con_list = []
+for r in range(rows):
+    partial_list = [str(redemption_df['member_id'][r])]
+    partial_list.append(str(redemption_df['stamp_program_id'][r]))
+
+    gift_item = redemption_df['gift_tier_str'][r].split('|@|')[1]
+    if gift_item[0].isalpha():
+        partial_list.append(gift_item)
+    else:
+        partial_list.append('')
+    if gift_item[0].isalpha():
+        partial_list.append('')
+    else:
+        partial_list.append(gift_item)
+    if gift_item[0].isalpha():
+        partial_list.append(0)
+    else:
+        partial_list.append(1)
+
+    partial_list.append(str(redemption_df['gift_stamp_required'][r]))
+    partial_list.append(str(redemption_df['pickup_mall_id'][r]))
+    partial_list.append(str(redemption_df['gift_btn_text_en'][r]))
+    partial_list.append(str(redemption_df['gift_btn_text_tc'][r]))
+    partial_list.append(str(redemption_df['redeem_status'][r]))
+    partial_list.append(str(redemption_df['redeem_date'][r]))
+    partial_list.append(redemption_df['recordtime'][r])
+    partial_list.append(redemption_df['lastupdatetime'][r])
+    partial_list.append(redemption_df['gift_1_trans_id'][r])
+    con_list.append(partial_list)
+
+list_title = ['member_id', 'stamp_program_id', 'isPhysicalGift', 'isPoint', 'PointOrGift', 'gift_stamp_required',
+                  'pickup_mall_id', 'gift_btn_text_en', 'gift_btn_text_tc', 'redeem_status', 'redeem_date', 'recordtime',
+                  'lastupdatetime', 'gift_1_trans_id']
+gift_list = pd.DataFrame(np.array(con_list), columns=list_title)
+
+gift_list['lastupdatetime'] = pd.to_datetime(gift_list['lastupdatetime'], format="%Y-%m-%d %H:%M:%S" )
+gift_list['recordtime'] = pd.to_datetime(gift_list['recordtime'], format="%Y-%m-/%d %H:%M:%S" )
+
+ods_stamp_redemption = spark.createDataFrame(gift_list)
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+ods_stamp_redemption.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+print(f"Result Saved in {output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+

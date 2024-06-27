@@ -1,0 +1,221 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03parking"
+    db02="tpdt_02replica"
+    dbadhoc = 'tpdt_03adhoc'
+    output_path="s3://tpdt-parking/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03parking_"+env
+    output_path="s3://tpdt-parking-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+prefix02 = "tpdt_"
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_vip_member', transformation_ctx = "member")
+member_df = t_member.toDF().select(col('member_id').alias('memberId')).filter("status = 'V'")
+member_df.createOrReplaceTempView("member")
+print("Source Extraction Finished: Member...")
+
+
+##source table : ev_rsr_raw_etl
+t_ev_rsr_raw = glueContext.create_dynamic_frame.from_catalog(database = dbadhoc, table_name = prefix02 + 'ev_rsr_raw_etl', transformation_ctx = "ev_rsr_raw_etl")
+ev_rsr_raw_df = t_ev_rsr_raw.toDF().select('rsrid',
+                                            'duration',
+                                            'status',
+                                            'createdttm',
+                                            'startdttm',
+                                            'enddttm',
+                                            'actualenddttm',
+                                            'lupddttm',
+                                            'tranid',
+                                            'chargerid',
+                                            'connector',
+                                            'stoptype',
+                                            'externalmemberid',
+                                            'mallid',
+                                            'carparkid',
+                                            'graceperiodenddttm',
+                                            'expectedchargingfee',
+                                            'expectedpenaltyfee',
+                                            'currentunitsession',
+                                            'pointredemption',
+                                            'redeemunitsessions',
+                                            'lp',
+                                            'redeemcount',
+                                            'penaltymins',
+                                            'sessionunitexpectedendtime',
+                                            'actualfinishedtime',
+                                            'redeemexpiretime',
+                                            'referencefee',
+                                            'referencepenalty',
+                                            'referencepoint',
+                                            'referencechargingunit',
+                                            'referencepenaltyunit',
+                                            'referencemaxchargingunit',
+                                            'paymentresultid',
+                                            'brandin',
+                                            'brandout',
+                                            'lpin',
+                                            'lpout',
+                                            'lprssessionid',
+                                            'evdisconnectedtime',
+                                            'carentrytime',
+                                            'carleavetime',
+                                            'lprsbayid')
+ev_rsr_raw_df.createOrReplaceTempView("ev_rsr_raw_etl")
+print("Source Extraxtion Finished: ev_rsr_raw_etl...")
+
+
+##source table : delta_tpdt_ev_rsr_raw
+delta_date = (datetime.today() + timedelta(hours=8) - timedelta(days=1)).strftime('%Y%m%d')
+print('delta_date: ' + str(delta_date))
+
+s3_path = "s3://tpdt-parking/tpdt_ev_rsr_raw/ev_rsr_" + delta_date + "*.json"
+delta_ev_rsr_raw_df = spark.read.json(s3_path)
+delta_ev_rsr_raw_df = delta_ev_rsr_raw_df.select('rsrId',
+                                                'duration',
+                                                'status',
+                                                'createDttm',
+                                                'startDttm',
+                                                'endDttm',
+                                                'actualEndDttm',
+                                                'lupdDttm',
+                                                'tranId',
+                                                'chargerId',
+                                                'connector',
+                                                'stopType',
+                                                'externalMemberId',
+                                                'mallId',
+                                                'carparkId',
+                                                'gracePeriodEndDttm',
+                                                'expectedChargingFee',
+                                                'expectedPenaltyFee',
+                                                'currentUnitSession',
+                                                'pointRedemption',
+                                                'redeemUnitSessions',
+                                                'lp',
+                                                'redeemCount',
+                                                'penaltyMins',
+                                                'sessionUnitExpectedEndTime',
+                                                'actualFinishedTime',
+                                                'redeemExpireTime',
+                                                'referenceFee',
+                                                'referencePenalty',
+                                                'referencePoint',
+                                                'referenceChargingUnit',
+                                                'referencePenaltyUnit',
+                                                'referenceMaxChargingUnit',
+                                                'paymentResultId',
+                                                'brandIn',
+                                                'brandOut',
+                                                'lpin',
+                                                'lpOut',
+                                                'lprsSessionId',
+                                                'evDisconnectedTime',
+                                                'carEntryTime',
+                                                'carLeaveTime',
+                                                'lprsBayId')
+delta_ev_rsr_raw_df.createOrReplaceTempView("delta_ev_rsr_raw_df")
+print("Source Extraxtion Finished: tpdt_ev_rsr_raw.json...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+ev_rsr_raw_union = delta_ev_rsr_raw_df.union(ev_rsr_raw_df)
+
+ev_rsr_raw_final = ev_rsr_raw_union.join(member_df, upper(ev_rsr_raw_union.externalMemberId) == upper(member_df.memberId), how='left') \
+    .withColumn('lp_final', when(col('memberId').isNotNull() & col('lp').isNotNull() & (length(col('lp')) != 64).cast("boolean"), sha2(upper(col('lp')), 256)).otherwise(col('lp'))) \
+    .withColumn('lpin_final', when(col('memberId').isNotNull() & col('lpin').isNotNull() & (length(col('lp')) != 64).cast("boolean"), sha2(upper(col('lpin')), 256)).otherwise(col('lpin'))) \
+    .withColumn('lpout_final', when(col('memberId').isNotNull() & col('lpOut').isNotNull() & (length(col('lp')) != 64).cast("boolean"), sha2(upper(col('lpOut')), 256)).otherwise(col('lpOut'))) \
+    .select(col('rsrId').alias('rsrid'),
+            col('duration').alias('duration'),
+            col('status').alias('status'),
+            col('createDttm').alias('createdttm'),
+            col('startDttm').alias('startdttm'),
+            col('endDttm').alias('enddttm'),
+            col('actualEndDttm').alias('actualenddttm'),
+            col('lupdDttm').alias('lupddttm'),
+            col('tranId').alias('tranid'),
+            col('chargerId').alias('chargerid'),
+            col('connector').alias('connector'),
+            col('stopType').alias('stoptype'),
+            col('externalMemberId').alias('externalmemberid'),
+            col('mallId').alias('mallId'),
+            col('carparkId').alias('carparkid'),
+            col('gracePeriodEndDttm').alias('graceperiodenddttm'),
+            col('expectedChargingFee').alias('expectedchargingfee'),
+            col('expectedPenaltyFee').alias('expectedpenaltyfee'),
+            col('currentUnitSession').alias('currentunitsession'),
+            col('pointRedemption').alias('pointredemption'),
+            col('redeemUnitSessions').alias('redeemunitsessions'),
+            col('lp_final').alias('lp'),
+            col('redeemCount').alias('redeemcount'),
+            col('penaltyMins').alias('penaltymins'),
+            col('sessionUnitExpectedEndTime').alias('sessionunitexpectedendtime'),
+            col('actualFinishedTime').alias('actualfinishedtime'),
+            col('redeemExpireTime').alias('redeemexpiretime'),
+            col('referenceFee').alias('referencefee'),
+            col('referencePenalty').alias('referencepenalty'),
+            col('referencePoint').alias('referencepoint'),
+            col('referenceChargingUnit').alias('referencechargingunit'),
+            col('referencePenaltyUnit').alias('referencepenaltyunit'),
+            col('referenceMaxChargingUnit').alias('referencemaxchargingunit'),
+            col('paymentResultId').alias('paymentresultid'),
+            col('brandIn').alias('brandin'),
+            col('brandOut').alias('brandout'),
+            col('lpin_final').alias('lpin'),
+            col('lpout_final').alias('lpout'),
+            col('lprsSessionId').alias('lprssessionid'),
+            col('evDisconnectedTime').alias('evdisconnectedtime'),
+            col('carEntryTime').alias('carentrytime'),
+            col('carLeaveTime').alias('carleavetime'),
+            col('lprsBayId').alias('lprsbayid')
+            )
+ev_rsr_raw_final.createOrReplaceTempView("ev_rsr_raw_final")
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+ev_rsr_raw_final.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+

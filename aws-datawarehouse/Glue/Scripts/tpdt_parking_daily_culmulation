@@ -1,0 +1,286 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db02 = "tpdt_02replica"
+    db03 = "tpdt_03dw"
+    db03sub = "tpdt_03sub"
+    db03_parking = "tpdt_03parking"
+    output_path = "s3://tpdt-parking/"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    db03sub = "tpdt_03sub_" + env
+    db03_parking = "tpdt_03parking" + env
+    output_path = "s3://tpdt-dw-" + env + "/" + table_name + "/"
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+
+prefix = "shkpmalls_carpark_"
+prefix03 = 'tpdt_'
+dimension_prefix = "bi_dimension_"
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : vehicles
+t_vehicles = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'vehicles',
+                                                           transformation_ctx="vehicles")
+vehicles_df = t_vehicles.toDF()
+vehicles_df.createOrReplaceTempView("vehicles")
+print("Source Extraxtion Finished: vehicles...")
+
+##source table : carpark_user_event_log
+t_carpark_user_event_log = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                         table_name=prefix + 'carpark_user_event_log',
+                                                                         transformation_ctx="carpark_user_event_log")
+carpark_user_event_log_df = t_carpark_user_event_log.toDF()
+carpark_user_event_log_df.createOrReplaceTempView("carpark_user_event_log")
+print("Source Extraxtion Finished: carpark_user_event_log ...")
+
+##source table : carinoutlog
+t_carinoutlog = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'carinoutlog',
+                                                              transformation_ctx="carinoutlog")
+carinoutlog_df = t_carinoutlog.toDF() \
+    .filter("operation = 'in'") \
+    .filter("cast(timestamp as date) between trunc(date_sub(cast(current_timestamp() as date),1), 'month') and date_sub(cast(current_timestamp() as date),1) ")
+print("Source Extraxtion Finished: carinoutlog ..")
+
+##source table : redemption
+t_redemption = glueContext.create_dynamic_frame.from_catalog(database=db03, table_name=prefix03 + 'dw_redemption',
+                                                             transformation_ctx="dw_redemption")
+redemption_df = t_redemption.toDF()
+redemption_df.createOrReplaceTempView("redemption")
+print("Source Extraxtion Finished: redemption..")
+
+##source table : tpdt_dw_parker_identify_history
+t_parker_identify_history = glueContext.create_dynamic_frame.from_catalog(database=db03_parking,
+                                                                          table_name=prefix03 + 'dw_parker_identify_history',
+                                                                          transformation_ctx="dw_parker_identify_history")
+dw_parker_identify_history_df = t_parker_identify_history.toDF()
+dw_parker_identify_history_df.createOrReplaceTempView("parker_identify_history")
+print("Source Extraxtion Finished: dw_parker_identify_history..")
+
+##source table : carpark_merchant_map
+t_carpark_merchant_map = glueContext.create_dynamic_frame.from_catalog(database=db01,
+                                                                       table_name=prefix + 'carpark_merchant_map',
+                                                                       transformation_ctx="carpark_merchant_map")
+carpark_merchant_map_df = t_carpark_merchant_map.toDF()
+carpark_merchant_map_df.createOrReplaceTempView("carpark_merchant_map")
+print("Source Extraxtion Finished: carpark_merchant_map ...")
+
+## mapping table : dim_mall_mapping
+t_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                               table_name=dimension_prefix + 'dim_mall_mapping',
+                                                               transformation_ctx="dim_mall_mapping")
+mall_mapping_df = t_mall_mapping.toDF()
+mall_mapping_df.createOrReplaceTempView("dim_mall_mapping")
+
+## mapping table : dim_autopayment_base_member_list
+t_dim_autopayment_base_member_list = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                                                   table_name=dimension_prefix + 'dim_autopayment_base_member_list',
+                                                                                   transformation_ctx="dim_autopayment_base_member_list")
+dim_autopayment_base_member_list_df = t_dim_autopayment_base_member_list.toDF()
+dim_autopayment_base_member_list_df.createOrReplaceTempView("dim_autopayment_base_member_list")
+
+## mapping table : ods_parking_autopay_log
+t_ods_parking_autopay_log = glueContext.create_dynamic_frame.from_catalog(database=db03_parking,
+                                                                          table_name=prefix03 + 'ods_parking_autopay_log',
+                                                                          transformation_ctx="ods_parking_autopay_log")
+ods_parking_autopay_log_df = t_ods_parking_autopay_log.toDF() \
+    .select('member_id',
+            'created_at',
+            'updated_at',
+            col('autopayment_activate').cast("integer").alias('autopayment_activate'))
+ods_parking_autopay_log_df.createOrReplaceTempView("ods_parking_autopay_log")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+contactless_transaction = carinoutlog_df.select(countDistinct(trim(lower(col('lpn'))))).collect()[0][0]
+
+contactless_parker_raw = spark.sql("""
+Select trim(lower(lpn)) as lpn, 
+       trim(lower(memberId)) as member_id 
+from vehicles
+where validationsts=1 and concat(trim(lower(lpn)), trim(lower(memberId))) not in 
+(Select concat(new_lpn, new_member_id) from 
+    (
+    Select trim(lower(lpn)) as new_lpn, trim(lower(member_id)) as new_member_id, min(log_id) as log_id
+    from carpark_user_event_log
+    where type in (7,2) and member_id is not null and event_time > date_sub(cast(current_timestamp() as date), 1)
+    group by trim(lower(lpn)), trim(lower(member_id))
+    )v
+)
+
+union all
+
+Select new_lpn, new_member_id from
+    (
+    Select trim(lower(lpn)) as new_lpn, trim(lower(member_id)) as new_member_id, min(log_id) as log_id, type
+    from carpark_user_event_log
+    where type in (7,2) and member_id is not null and event_time > date_sub(cast(current_timestamp() as date), 1)
+    group by trim(lower(lpn)), trim(lower(member_id)), type
+    )x
+where type = 2
+""")
+contactless_parker_raw.createOrReplaceTempView("contactless_parker_raw")
+
+contactless_parker = contactless_parker_raw.select(countDistinct(col('member_id'))).collect()[0][0]
+contactless_lpn = contactless_parker_raw.select(countDistinct(col('lpn'))).collect()[0][0]
+
+total_parker_raw = spark.sql("""
+Select Distinct trim(lower(member_id)) as member_id, trim(lower(car_plate)) as car_plate
+from (
+    Select t1.*
+    from parker_identify_history t1
+    left join redemption t2 on t1.redemption_transaction_id = t2.transaction_id
+    where t1.identify_type = 'identify by Inapp Free Parking Redemption' and
+          t2.redeem_date <= date_sub(cast(current_timestamp() as date), 1)
+
+    union all
+
+    Select *
+    from parker_identify_history
+    where identify_type = 'identify by Invoice'
+    and receipt_transaction_date <= date_sub(cast(current_timestamp() as date), 1)
+    
+    union all
+
+    Select *
+    from parker_identify_history
+    where identify_type = 'identify by member parking'
+    and date(freeparking_redemption_date_parking) <= date_sub(cast(current_timestamp() as date), 1)
+    
+    union all
+
+    Select *
+    from parker_identify_history
+    where identify_type = 'identify by EV Charging'
+    and date(ev_charging_date) <= date_sub(cast(current_timestamp() as date), 1)
+)x
+""")
+total_parker_raw.createOrReplaceTempView("total_parker_raw")
+
+non_contactless_parker_raw = spark.sql("""
+Select Distinct t1.member_id, t1.car_plate
+from total_parker_raw t1
+left join contactless_parker_raw t2 on t1.member_id = t2.member_id
+where t2.member_id is null
+""")
+
+non_contactless_parker = non_contactless_parker_raw.select(countDistinct(col('member_id'))).collect()[0][0]
+non_contactless_lpn = non_contactless_parker_raw.select(countDistinct(col('car_plate'))).collect()[0][0]
+
+contactless_parker_activate = spark.sql(
+    """
+    Select trim(lower(t1.member_id)) as member_id, trim(lower(t1.lpn)) as lpn, t4.property_id
+    from carpark_user_event_log t1
+    inner join (
+        Select member_id, lpn, max(event_time) as last_time
+        from carpark_user_event_log
+        where type = 7
+        group by member_id, lpn) t2 on t1.event_time=t2.last_time and t1.lpn=t2.lpn
+    left join carpark_merchant_map t3 on t1.carpark_id = t3.carpark_id
+    left join dim_mall_mapping t4 on t4.mall_id = t3.mall_id
+    where t1.member_id is not null and t1.type = 7
+    """
+)
+contactless_parker_activate.createOrReplaceTempView("contactless_parker_activate")
+
+culmulate_number_of_contactless_parkers_by_mall = spark.sql("""
+Select date_sub(cast(current_timestamp() as date), 1) as update_date, property_id, count(distinct member_id) as contactless_parker, count(distinct lpn) as contactless_lpn, current_timestamp() as last_updated_datetime
+from (
+    Select t1.member_id, t1.lpn, case when t2.property_id is null then 'Can not check' else t2.property_id end as property_id
+    from contactless_parker_raw t1
+    left join contactless_parker_activate t2 on t1.member_id = t2.member_id and t1.lpn = t2.lpn)v
+group by property_id
+""")
+
+auto_pay_list = spark.sql(
+    """
+    Select Distinct trim(lower(member_id)) as member_id from (
+        Select member_id, autopayment_activate as action_status
+        from dim_autopayment_base_member_list
+        union all
+        Select member_id, autopayment_activate as action_status
+        from ods_parking_autopay_log
+        where to_date(created_at) <= date_sub(cast(current_timestamp() as date), 1)
+    )x
+    group by member_id
+    having sum(action_status) > 0
+    """
+)
+auto_pay_list.createOrReplaceTempView("auto_pay_list")
+
+autopay_user = auto_pay_list.select(countDistinct(col('member_id'))).collect()[0][0]
+
+autopay_contactless_user_raw = spark.sql("""
+Select distinct t2.member_id 
+from auto_pay_list t1
+left join contactless_parker_raw t2 on t1.member_id = t2.member_id
+""")
+
+autopay_contactless_user = autopay_contactless_user_raw.select(countDistinct(col('member_id'))).collect()[0][0]
+
+columns = StructType([
+    StructField('contactless_lpn', IntegerType(), True),
+    StructField('contactless_parker', IntegerType(), True),
+    StructField('contactless_entries_during_that_month', IntegerType(), True),
+    StructField('non_contactless_parker', IntegerType(), True),
+    StructField('non_contactless_lpn', IntegerType(), True),
+    StructField('autopay_user', IntegerType(), True),
+    StructField('autopay_contactless_user', IntegerType(), True)
+])
+
+data = [(contactless_lpn, contactless_parker, contactless_transaction, non_contactless_parker, non_contactless_lpn,
+         autopay_user, autopay_contactless_user)]
+
+culmulate_number_of_autopay_contactless_parkers = spark.createDataFrame(data, schema=columns) \
+    .withColumn('update_date', date_sub(current_date(), 1)) \
+    .withColumn('last_updated_datetime', current_timestamp())
+
+culmulate_autopay_contactless_parkers = culmulate_number_of_autopay_contactless_parkers.select('update_date',
+                                                                                               'contactless_lpn',
+                                                                                               'contactless_parker',
+                                                                                               'contactless_entries_during_that_month',
+                                                                                               'non_contactless_parker',
+                                                                                               'non_contactless_lpn',
+                                                                                               'autopay_user',
+                                                                                               'autopay_contactless_user',
+                                                                                               'last_updated_datetime')
+
+culmulate_number_of_contactless_parkers_by_mall_output_path = f'{output_path}tpdt_culmulate_contactless_parkers_by_mall_raw/'
+culmulate_number_of_contactless_parkers_by_mall.write.format('parquet').mode('append').save(culmulate_number_of_contactless_parkers_by_mall_output_path)
+
+culmulate_autopay_contactless_parkers_output_path = f'{output_path}tpdt_culmulate_contactless_parkers_raw/'
+culmulate_autopay_contactless_parkers.write.format('parquet').mode('append').save(culmulate_autopay_contactless_parkers_output_path)

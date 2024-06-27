@@ -1,0 +1,92 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-adhoc/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    district_mapping_s3_location = 's3://tpdt-dimension/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    district_mapping_s3_location = 's3://tpdt-dimension-'+env+'/tpdt_dim_tp_district_mapping/tpdt_dim_tp_district_mapping.csv'
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : campaign profiles
+profile_location = "s3://tpdt-adobe-test/campaign_profile/"
+t_campaign_profile = spark.read.format("com.crealytics.spark.excel")\
+                          .option("header", "true")\
+                          .option("inferSchema", "true")\
+                          .load(profile_location+"campaign_master_ThePoint.xlsx")
+    
+mall_teams_profile = ['campaign_master_TeamA', 'campaign_master_TeamB', 'campaign_master_TeamC', 'campaign_master_TeamKS','campaign_master_RMCR']
+for profile in mall_teams_profile:
+    path = profile_location+profile+'.xlsx'
+    team_profile = spark.read.format("com.crealytics.spark.excel")\
+                        .option("header", "true")\
+                        .option("inferSchema", "true")\
+                        .load(path)
+    t_campaign_profile = t_campaign_profile.union(team_profile)
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Transformation 1: Adjust the expiry date
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+t_campaign_profile.write.format('parquet').mode('overwrite').partitionBy('paritionkey').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

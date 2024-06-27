@@ -1,0 +1,122 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-parking/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-parking-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_autopay_"
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_vip_member', transformation_ctx = "member")
+member_df = t_member.toDF().select(col('member_id').alias('memberId')).filter("status = 'V'")
+member_df.createOrReplaceTempView("member")
+print("Source Extraction Finished: Member...")
+
+
+##source table : carpark_autopay_lists
+t_carpark_autopay_lists = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'carpark_autopay_lists', transformation_ctx = "carpark_autopay_lists")
+carpark_autopay_lists_df = t_carpark_autopay_lists.toDF()
+carpark_autopay_lists_df.createOrReplaceTempView("carpark_autopay_lists")
+print("Source Extraxtion Finished: carpark_autopay_lists...")
+
+
+##source table : carpark_lists
+t_carpark_lists = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'carpark_lists', transformation_ctx = "carpark_lists")
+carpark_lists_df = t_carpark_lists.toDF()
+carpark_lists_df.createOrReplaceTempView("carpark_lists")
+print("Source Extraxtion Finished: carpark_autopay_lists...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+ods_parking_autopay_transaction = spark.sql(''' 
+    SELECT l.id,  l.carpark_id, cpl.mallid as mall_id, l.tradeno,
+    l.order_id, l.memid as member_id, l.lpn as car_plate, l.drive_outtime as car_out_datetime,
+    l.drive_outtime_source as car_out_datetime_source, l.outstanding_amt,
+    case when l.payment_type = 1 then 'Credit Card'
+         when l.payment_type = 2 then 'Mall Admin'
+         when l.payment_type = 3 then 'App' else NULL end as payment_type,
+    case when l.payment_result = 0 then 'Unpaid'
+         when l.payment_result = 1 then 'Success'
+         when l.payment_result = 2 then 'Freeze'
+         when l.payment_result = 3 then 'Pay Error'  else NULL end as payment_result,
+    l.payment_remark, l.autopay_result, l.abnormal, l.abnormal_remark, l.created_at, l.updated_at
+    FROM carpark_autopay_lists as l
+    left join carpark_lists as cpl on cpl.carparkid = l.carpark_id
+    ''')
+ods_parking_autopay_transaction.createOrReplaceTempView("ods_parking_autopay_transaction")
+
+
+ods_parking_autopay_transaction_final = ods_parking_autopay_transaction.join(member_df, upper(ods_parking_autopay_transaction.member_id) == upper(member_df.memberId), how='left') \
+    .withColumn('lpn_final', when(col('memberId').isNotNull() & col('car_plate').isNotNull(), sha2(upper(col('car_plate')), 256)).otherwise(col('car_plate'))) \
+    .select('id',
+            'carpark_id',
+            'mall_id',
+            'tradeno',
+            'order_id',
+            'member_id',
+            col('lpn_final').alias('car_plate'),
+            'car_out_datetime',
+            'car_out_datetime_source',
+            'outstanding_amt',
+            'payment_type',
+            'payment_result',
+            'payment_remark',
+            'autopay_result',
+            'abnormal',
+            'abnormal_remark',
+            'created_at',
+            'updated_at')
+ods_parking_autopay_transaction_final.createOrReplaceTempView("ods_parking_autopay_transaction_final")
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+ods_parking_autopay_transaction_final.write.format('parquet').partitionBy("mall_id").mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

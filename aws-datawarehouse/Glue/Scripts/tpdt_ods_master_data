@@ -1,0 +1,271 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import date
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-staging/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-staging-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+datamart_prefix = "bi_datamart_"
+dimension_prefix = "bi_dimension_"
+instant_solution_prefix = "thepoint_pos_"
+
+##source table : master_data
+t_master_data = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'master_data', transformation_ctx = "master")
+master_data_df = t_master_data.toDF()
+
+##source table : campaign
+t_campaign = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'campaign', transformation_ctx = "campaign")
+campaign_df = t_campaign.toDF()
+
+##source table : partner
+t_partner = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'partner', transformation_ctx = "partner")
+partner_df = t_partner.toDF()
+
+##source table : freeparking
+t_free_parking_record = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'free_parking_record', transformation_ctx = "free_parking_record")
+free_parking_record_df = t_free_parking_record.toDF()
+
+
+##source table : freeparking_spendinf_transaction
+t_free_parking_record_spending_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'free_parking_record_spending_transaction', transformation_ctx = "free_parking_record_spending_transaction")
+free_parking_record_spending_transaction_df = t_free_parking_record_spending_transaction.toDF()
+
+
+##source table : freeparking_spendinf_transaction
+t_parking_member_card = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_carpark_parking_member_card', transformation_ctx = "parking_member_card")
+parking_member_card_df = t_parking_member_card.toDF()\
+                                              .withColumn('status', when(col('status')==lit(1),lit('Binded')).otherwise(lit('Unbinded')))\
+                                              .select('card_id',
+                                                      'member_id',
+                                                      lit('').alias('card_token'),
+                                                      'status',
+                                                      'create_date',
+                                                      'is_default',
+                                                      'card_type')
+
+##source table : dt_tracking_user_log
+t_tracking_user_log_data = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = 'shkpmalls_wechat_analytics_dt_tracking_user_log', transformation_ctx = "dt_tracking")
+tracking_user_log_df = t_tracking_user_log_data.toDF()
+tracking_user_log_df.createOrReplaceTempView("tracking_user_log_df")
+
+
+##source table : tpdt_dim_wechat_mall_mapping
+t_tpdt_dim_wechat_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = 'tpdt_dim_wechat_mall_mapping', transformation_ctx = "dim_mall")
+tpdt_dim_wechat_mall_mapping_df = t_tpdt_dim_wechat_mall_mapping.toDF()
+tpdt_dim_wechat_mall_mapping_df.createOrReplaceTempView("tpdt_dim_wechat_mall_mapping_df")
+
+
+##source table : carpark
+t_carparks = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_carpark_carparks', transformation_ctx = "carparks")
+carparks_df = t_carparks.toDF()
+
+
+##source table : point_dollar_refund_mapping
+t_point_dollar_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'point_dollar_transaction', transformation_ctx = "point_dollar_transaction")
+point_dollar_transaction_df = t_point_dollar_transaction.toDF()
+point_dollar_transaction_df.createOrReplaceTempView("point_dollar_transaction")
+
+
+##source table : earn_transaction
+t_earn_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = instant_solution_prefix+'earn_transaction', transformation_ctx = "earn_transaction")
+earn_transaction_raw_df = t_earn_transaction.toDF()
+earn_transaction_raw_df.createOrReplaceTempView("earn_transaction")
+
+
+## Data Tranformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+point_dollar_transaction_refund_df = spark.sql("""
+	Select distinct
+		trans_id as refund_id,
+		ori_trans_id
+	from point_dollar_transaction
+	where trans_type = 'R'
+""")
+
+
+wechat_raw_table_df = spark.sql("""
+SELECT
+path,
+openid,
+last_track_time,
+scene,
+rank() OVER (PARTITION BY openid, scene ORDER BY last_track_time ASC) as ranking
+FROM tracking_user_log_df
+WHERE path IN ('pages/register/register4','pages/register/register_success')
+AND year(last_track_time) >= 2023
+""")
+wechat_raw_table_df.createOrReplaceTempView("wechat_raw_table_df")
+
+
+wechat_ranking_df = spark.sql("""
+SELECT DISTINCT
+path,
+openid,
+last_track_time,
+scene
+FROM wechat_raw_table_df
+WHERE ranking = 1
+""")
+wechat_ranking_df.createOrReplaceTempView("wechat_ranking_df")
+
+
+wechat_extracted_path_df = spark.sql("""
+SELECT
+path,
+openid,
+last_track_time,
+scene,
+CASE
+WHEN scene LIKE '{"path":"pages/boot_page","query":{"key":"%' THEN replace(replace(replace(CAST(get_json_object(get_json_object(scene, '$.query'), '$.key') AS string), '"', ''), 'key=', ''), 'key%3D', '')
+WHEN scene LIKE '{"path":"pages/boot_page","query":{"scene":"%' THEN replace(replace(replace(replace(replace(CAST(get_json_object(get_json_object(scene, '$.query'), '$.scene') AS string), '"', ''), 'key=', ''), 'key%3D', ''), 'oa%3Dbtl-', ''), 'btl-', '') 
+WHEN scene LIKE '{"path":"pages/login","query":{"scene":"%' THEN replace(replace(replace(replace(replace(replace(CAST(get_json_object(get_json_object(scene, '$.query'), '$.scene') AS string), '"', ''), 'key=', ''), 'key%3D', ''), 'oa%3D', ''), 'btl-', ''), 'oa=', '') 
+WHEN scene LIKE '{"path":"pages/login","query":{"oa":"%' THEN replace(replace(replace(CAST(get_json_object(get_json_object(scene, '$.query'), '$.oa') AS string), '"', ''), 'key=', ''), 'key%3D', '')
+ELSE 'OTHERS' 
+END as extracted_mall_id
+FROM wechat_ranking_df
+""")
+wechat_extracted_path_df.createOrReplaceTempView("wechat_extracted_path_df")
+
+
+wechat_raw_final_df = spark.sql("""
+SELECT
+path,
+openid,
+last_track_time,
+'N/A' as scene,
+extracted_mall_id,
+CASE WHEN mall IS NOT NULL THEN mall ELSE 'OTHERS' END as finalised_mall_id,
+rank() OVER (PARTITION BY openid, extracted_mall_id ORDER BY last_track_time ASC) as ranking
+FROM wechat_extracted_path_df t1
+LEFT JOIN (SELECT trackingpath, mall FROM tpdt_dim_wechat_mall_mapping_df)t2
+ON upper(t1.extracted_mall_id) = upper(t2.trackingpath)
+""")
+wechat_raw_final_df.createOrReplaceTempView("wechat_raw_final_df")
+
+
+wechat_final_df = spark.sql("""
+SELECT
+DISTINCT
+path,
+openid,
+last_track_time,
+scene,
+extracted_mall_id,
+finalised_mall_id
+FROM wechat_raw_final_df
+WHERE ranking = 1
+and openid != 'undefined'
+and openid != ''
+""")
+
+
+earn_transaction_df = spark.sql("""
+	Select
+	    id,
+	    receipt_id,
+	    mall_id,
+	    shop_id,
+	    amount,
+	    datetime,
+	    member_id,
+	    created_at,
+	    updated_at,
+	    type,
+	    reject_reason,
+	    earn_amount,
+	    case when valid_to_earn_point = 'N' then 'Rejected'
+	        when valid_to_earn_point = 'W' then 'Approved'
+	        when valid_to_earn_point = 'P' then 'Partial Approved'
+	        else null
+	    end as valid_to_earn_point
+	from earn_transaction
+	where date(datetime) >= '2023-07-01'
+""")
+
+# save
+master_data_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+
+campaign_output_path="s3://tpdt-staging/tpdt_ods_campaign/"
+campaign_df.write.format('parquet').mode('overwrite').option("header",True).save(campaign_output_path)
+print(f"Result Saved in {campaign_output_path}...")
+
+
+partner_output_path="s3://tpdt-staging/tpdt_ods_partner/"
+partner_df.write.format('parquet').mode('overwrite').option("header",True).save(partner_output_path)
+print(f"Result Saved in {partner_output_path}...")
+
+free_parking_record_df_output_path="s3://tpdt-parking/tpdt_ods_free_parking_record/"
+free_parking_record_df.write.format('parquet').mode('overwrite').option("header",True).save(free_parking_record_df_output_path)
+print(f"Result Saved in {free_parking_record_df_output_path}...")
+
+free_parking_record_spending_transaction_df_path="s3://tpdt-parking/tpdt_ods_free_parking_record_spending_transaction/"
+free_parking_record_spending_transaction_df.write.format('parquet').mode('overwrite').option("header",True).save(free_parking_record_spending_transaction_df_path)
+print(f"Result Saved in {free_parking_record_spending_transaction_df_path}...")
+
+member_card_path="s3://tpdt-staging/tpdt_ods_member_card_binding/"
+parking_member_card_df.write.format('parquet').mode('overwrite').option("header",True).save(member_card_path)
+print(f"Result Saved in {member_card_path}...")
+
+carparks_df_output_path="s3://tpdt-parking/tpdt_ods_carparks/"
+carparks_df.write.format('parquet').mode('overwrite').option("header",True).save(carparks_df_output_path)
+print(f"Result Saved in {carparks_df_output_path}...")
+
+point_dollar_transaction_refund_path="s3://tpdt-staging/tpdt_point_dollar_transaction_refund/"
+point_dollar_transaction_refund_df.write.format('parquet').mode('overwrite').option("header",True).save(point_dollar_transaction_refund_path)
+print(f"Result Saved in {point_dollar_transaction_refund_path}...")
+
+wechat_df_output_path="s3://tpdt-staging/tpdt_wechat_registration_tracking/"
+wechat_final_df.write.format('parquet').mode('overwrite').option("header",True).save(wechat_df_output_path)
+print(f"Result Saved in {wechat_df_output_path}...")
+
+earn_transaction_df_output_path="s3://tpdt-staging/tpdt_ods_earn_transaction/"
+earn_transaction_df.write.format('parquet').mode('overwrite').option("header",True).save(earn_transaction_df_output_path)
+print(f"Result Saved in {earn_transaction_df_output_path}...")
+
+

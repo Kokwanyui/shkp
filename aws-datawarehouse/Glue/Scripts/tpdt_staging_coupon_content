@@ -1,0 +1,189 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType, IntegerType
+from pyspark.sql.functions import when, lit
+import pandas as pd
+import numpy as np
+import json
+from functools import reduce
+#from bs4 import BeautifulSoup
+
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+
+
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+csv_name = args['JOB_NAME']+'.csv'
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_folder="s3://tpdt-staging/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_folder="s3://tpdt-staging-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+output_prefix = 'tpdt_'
+
+
+
+# ------------------------------------------------- source table : coupon -------------------------------------------------------------------------------
+t_coupon = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'coupon', transformation_ctx = "coupon")
+coupon_df = t_coupon.toDF()
+
+
+# ---------------------------------------------------- ODS : ods_coupon_shop-------------------------------------------------------------------------------
+coupon_shop_sp = coupon_df.select('coupon_id','usage_shop_id').filter("usage_shop_id is not null")
+coupon_shop = coupon_shop_sp.toPandas()
+
+
+shop_title=['coupon_id','shop_id']
+shop_list=[]
+
+rows=len(coupon_shop)
+for r in range(rows):
+    internal=json.loads(coupon_shop['usage_shop_id'][r])
+    for koi in internal.values():
+        for fish in koi:
+
+            shop_item=[]
+            shop_item.append(coupon_shop['coupon_id'][r])
+            shop_item.append(fish)
+            shop_list.append(shop_item)
+
+shop=pd.DataFrame(np.array(shop_list),columns=shop_title)
+shop_sparkdf=spark.createDataFrame(shop)
+
+output_path=output_folder + output_prefix + "staging_coupon_shop/"
+shop_sparkdf.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+
+
+# ---------------------------------------------------- ODS : ods_coupon_enable_mall-------------------------------------------------------------------------------
+coupon_mall_sp = coupon_df.select('coupon_id','enable_in_mall').filter("enable_in_mall is not null")
+coupon_mall = coupon_mall_sp.toPandas()
+
+mall_title=['coupon_id','enable_mall_id']
+mall_list=[]
+
+
+rows=len(coupon_mall)
+for r in range(rows):
+    internal=json.loads(coupon_mall['enable_in_mall'][r])
+    for koi in internal.values():
+        for fish in koi:
+
+            mall_item=[]
+            mall_item.append(coupon_mall['coupon_id'][r])
+            mall_item.append(fish)
+
+            mall_list.append(mall_item)
+
+mall=pd.DataFrame(np.array(mall_list),columns=mall_title)
+mall_sparkdf=spark.createDataFrame(mall)
+output_path=output_folder + output_prefix + "staging_coupon_enable_mall/"
+mall_sparkdf.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+# ---------------------------------------------------- ODS : ods_coupon_redeem-------------------------------------------------------------------------------
+coupon_redeem_sp = coupon_df.select('coupon_id','redeem_bonus_points').filter("redeem_bonus_points is not null")
+coupon_redeem = coupon_redeem_sp.toPandas()
+#coupon_redeem['redeem_bonus_points'] = coupon_redeem['redeem_bonus_points'].str.replace('[','').str.replace(']','')
+
+redeem_title=['coupon_id','bonus_point','member_level_id']
+redeem_list=[]
+rows=len(coupon_redeem)
+
+for r in range(rows):
+    internal=json.loads(coupon_redeem['redeem_bonus_points'][r])
+    number_of_keys = len(internal)
+    for key in range(number_of_keys):
+       for fish in internal[key].keys():
+
+           coupon_redeem.loc[r,fish] = internal[key][fish]
+'''
+    for koi in internal.values():
+        for fish in koi:
+
+            redeem_item=[]
+            redeem_item.append(coupon_redeem['coupon_id'][r])
+            redeem_item.append(fish)
+
+            redeem_list.append(redeem_item)
+print(redeem_list)'''
+
+
+redeem_sparkdf=spark.createDataFrame(coupon_redeem)
+redeem_sparkdf = redeem_sparkdf.withColumn('bonus_point', col("bonus_point").cast("int"))
+
+output_path=output_folder + output_prefix + "staging_coupon_redeem/"
+redeem_sparkdf.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+
+
+
+
+
+
+
+
+# ---------------------------------------------------- ODS : ods_coupon_content-------------------------------------------------------------------------------
+coupon_content_staging = coupon_df.select('coupon_id','mall_id','status','coupon_category_id','name_lang1','name_lang2','name_lang3','usage_expiry_date','usage_expiry_day', 'value_amount','face_value','unlimited_inventory', 'created_date','type')\
+                                 .withColumn('usage_expiry_date',  when(year(coupon_df.usage_expiry_date) < 1970, to_timestamp(lit('1970-01-01 23:59:59'),'yyyy-MM-dd HH:mm:ss')).otherwise(coupon_df.usage_expiry_date))
+coupon_content_sp = coupon_df.select(col('coupon_id').alias('mapping_coupon_id'),'redeem_bonus_points', 'redeem_with_cash', 'redeem_bonus_points_with_cash')
+
+coupon_content = coupon_content_sp.toPandas()
+
+columns_in_json = ['redeem_bonus_points', 'redeem_with_cash', 'redeem_bonus_points_with_cash']
+rows = len(coupon_content)
+
+for column in columns_in_json:
+    for row in range(rows):
+        try:
+            internal = json.loads(coupon_content[column][row])
+            number_of_keys = len(internal)
+            for key in range(number_of_keys):
+                for fish in internal[key].keys():
+                    column_key = str(key + 1)
+                    column_name = fish + '_{}'.format(column_key)
+                    coupon_content.loc[row, column_name] = str(internal[key][fish])
+        except:
+            pass
+print(coupon_content.info())
+coupon_content = coupon_content.drop(columns = ['redeem_bonus_points', 'redeem_with_cash', 'redeem_bonus_points_with_cash']).replace(np.NaN, '')
+coupon_content=spark.createDataFrame(coupon_content)
+
+
+coupon_content_staging =coupon_content_staging.join(coupon_content, coupon_content_staging.coupon_id == coupon_content.mapping_coupon_id, how='left').drop('mapping_coupon_id')
+
+
+## Loading Result to S3
+print("Saving Result into target destination...")
+output_path=output_folder + output_prefix + "staging_coupon_content/"
+coupon_content_staging.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+

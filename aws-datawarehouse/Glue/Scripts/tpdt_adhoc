@@ -1,0 +1,69 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import date
+import re
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+district_tablename = 'tpdt_dim_tp_district_mapping.csv'
+
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-staging/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    district_mapping_s3_location = 's3://tpdt-dimension/tpdt_dim_tp_district_mapping/'+district_tablename
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-staging-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+df1 = spark.read.csv('s3://tpdt-staging/spending_backup_20230814_2/dm_spending_2022_or_after_20230813050840_processed.csv.gz', header='true', inferSchema='true', sep=';')
+df2 = spark.read.csv('s3://tpdt-staging/spending_backup_20230814_2/dm_spending_20230813050840_processed.csv.gz', header='true', inferSchema='true', sep=';')
+df = df1.union(df2).distinct()
+final_df = df.withColumn('receipt_upload_date', to_date(col('receipt_upload_date'), "yyyy-MM-dd"))\
+        .withColumn('receipt_transaction_date', to_date(col('receipt_transaction_date'), "yyyy-MM-dd"))\
+        .withColumn('approve_or_reject_date', to_date(col('approve_or_reject_date'), "yyyy-MM-dd"))\
+        .withColumn('registration_date', to_date(col('registration_date'), "yyyy-MM-dd"))\
+        .withColumn('ocr_id', col('ocr_id').cast(IntegerType()))\
+        .withColumn('member_tier', lit('Normal Member'))\
+        .withColumn('receipt_upload_datetime', to_timestamp(col('receipt_upload_datetime'),'yyyy-MM-dd HH:mm:ss'))\
+        .withColumn('receipt_transaction_datetime', to_timestamp(col('receipt_transaction_datetime'),'yyyy-MM-dd HH:mm:ss'))\
+        .withColumn('approve_or_reject_datetime', to_timestamp(col('approve_or_reject_datetime'),'yyyy-MM-dd HH:mm:ss'))\
+        .withColumn('updated_date', to_timestamp(col('updated_date'),'yyyy-MM-dd HH:mm:ss'))
+
+spending_output_path="s3://tpdt-dw/tpdt_dw_spending/"
+final_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header",True).save(spending_output_path)

@@ -1,0 +1,143 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from dateutil.relativedelta import relativedelta
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    db03campaign="tpdt_03campaign"
+    output_path="s3://tpdt-campaign/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    db03campaign="tpdt_03campaign_"+env
+    output_path="s3://tpdt-campaign-testing-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+dimension_prefix = "bi_dimension_"
+prefix="shkpmalls_vip_"
+prefix03='tpdt_'
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Mechanism Tables
+t_campaign_tier = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_tier', transformation_ctx = "spending_campaign_tier")
+campaign_tier_df = t_campaign_tier.toDF()
+campaign_tier_df.createOrReplaceTempView("spending_campaign_tier")
+
+t_spending_campaign_tier_reward = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign_tier_reward', transformation_ctx = "spending_campaign_tier_reward")
+spending_campaign_tier_reward_df = t_spending_campaign_tier_reward.toDF()
+spending_campaign_tier_reward_df.createOrReplaceTempView("spending_campaign_tier_reward")
+
+t_spending_campaign = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_campaign', transformation_ctx = "spending_campaign")
+spending_campaign_df = t_spending_campaign.toDF()
+spending_campaign_df.createOrReplaceTempView("spending_campaign")
+
+t_owner = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_ecoupon_campagin_owner', transformation_ctx = "dim_ecoupon_campagin_owner")
+owner_df = t_owner.toDF()
+owner_df.createOrReplaceTempView("owner")
+
+
+#tpdt_ecoupon_campaign_redemption
+t_campaign_redemption = glueContext.create_dynamic_frame.from_catalog(database = db03campaign, table_name = prefix03+'ecoupon_campaign_redemption', transformation_ctx = "campaign_redemption")
+campaign_redemption_df = t_campaign_redemption.toDF()
+campaign_redemption_df.createOrReplaceTempView("campaign_redemption")
+
+#tpdt_ecoupon_campaign_transaction
+t_campaign_transaction = glueContext.create_dynamic_frame.from_catalog(database = db03campaign, table_name = prefix03+'ecoupon_campaign_transaction', transformation_ctx = "campaign_transaction")
+campaign_transaction_df = t_campaign_transaction.toDF()
+campaign_transaction_df.createOrReplaceTempView("campaign_transaction")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+# Transformation 1: Prepare Ecoupon Campaign Mechanism
+mechanisms_df = spark.sql("""
+SELECT
+	t1.spending_campaign_id,
+	t1.tier_id,
+    t1.tier_order                               as campaign_tier,
+	t1.redeem_amount,
+	t1.total_redemption_limit                   as tier_total_redemption_limit,
+	t1.daily_redemption_limit_per_mall          as tier_daily_redemption_limit_per_mall,
+    t2.reward_id,
+    t2.qty                                      as coupon_qty,
+    t3.status                                   as campaign_status,
+    t3.start_date                               as campaign_start_date,
+    t3.end_date                                 as campaign_end_date,
+    t3.name_lang1                               as campaign_name,
+    t3.type                                     as campaign_type,
+    t3.condition_id                             as campaign_condition_id,
+    t3.daily_redemption_limit_per_mall          as campaign_daily_redemption_limit_per_mall,
+    t3.total_redemption_limit                   as campaign_total_redemption_limit,
+    t4.ownership                                as campaign_owner,
+    case when date(t3.start_date) <= date_sub(CAST(current_timestamp() as DATE), 1) and t3.end_date >= date_sub(CAST(current_timestamp() as DATE), 90) then 1
+    else 0 end                                  as display_in_transaction
+FROM spending_campaign_tier t1
+left join spending_campaign_tier_reward t2 on t1.tier_id = t2.tier_id
+left join spending_campaign t3 on t1.spending_campaign_id = t3.spending_campaign_id
+left join owner t4 on t1.spending_campaign_id = t4.spending_campaign_id
+""")
+
+# Transformation 2: identify camapign to achrive
+archive_campaign = mechanisms_df.filter("display_in_transaction = 0").distinct()
+archive_campaign.createOrReplaceTempView("archive_campaign")
+
+# Transformation 3: achrive tpdt_ecoupon_campaign_redemption
+archive_campaign_redemption = spark.sql("""
+Select t1.*
+from campaign_redemption t1
+inner join archive_campaign t2 on t1.spending_campaign_id = t2.spending_campaign_id
+""")
+
+# Transformation 4: achrive tpdt_ecoupon_campaign_transaction
+archive_campaign_transaction = spark.sql("""
+Select t1.*
+from campaign_transaction t1
+inner join archive_campaign t2 on t1.spending_campaign_id = t2.spending_campaign_id
+""")
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+mechanism_detail_output_path = f'{output_path}tpdt_ecoupon_campagin_mechanism/'
+mechanisms_df.write.format('parquet').mode('overwrite').option("header",True).save(mechanism_detail_output_path)
+
+archive_campaign_redemption_output_path = output_path+'tpdt_ecoupon_archive_redemption/'
+archive_campaign_redemption.write.format('parquet').mode('append').option("header",True).save(archive_campaign_redemption_output_path)
+
+archive_campaign_transaction_output_path = output_path+'tpdt_ecoupon_archive_transaction/'
+archive_campaign_transaction.write.format('parquet').mode('append').option("header",True).save(archive_campaign_transaction_output_path)

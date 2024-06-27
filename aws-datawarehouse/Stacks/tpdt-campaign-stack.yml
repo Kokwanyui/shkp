@@ -1,0 +1,271 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Stack to deploy marketing campaign related resources
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  GlueIamRole:
+    Type: String
+  GlueVersion:
+    Type: String
+  GlueDB01replica:
+    Type: String
+  S3ArtifactBucket:
+    Type: String
+  GluejobNumberOfWorkers:
+    Type: Number
+    Description: number of workers for Glue Job
+  S3NameGlueTemporary:
+    Type: String
+  GlueConnector01replica:
+    Type: String
+
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+  IsNotDev: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'dev'
+
+Resources:
+# Creating S3 Buckets - Start
+  S3Campaign:
+    Description: bucket for campaign related tables
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - campaign
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: campaign
+# Creating S3 Buckets - End
+
+# Creating Glue DataBase - Start
+  GlueDBcampaign:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database to connect campaign bucket
+        Name: !Join
+          - '_'
+          - - !Ref AWSTeam
+            - 03campaign
+            - !If
+              - IsNotPrd
+              - !Ref AWSEnv
+              - !Ref 'AWS::NoValue'
+# Creating Glue DataBase - End
+
+# Creating Glue S3 Crawler - Start
+  CrawlerS3Campaign:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - s3
+          - campaign
+          - crawler
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Role: !Ref GlueIamRole
+      Description: Crawl campaign data in S3
+      DatabaseName: !Ref GlueDBcampaign
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${S3Campaign}'
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Tags: {
+        application: !Ref AWSTeam ,
+        environment: !Ref AWSEnv ,
+        stack: campaign
+      }
+# Creating Glue S3 Crawler - End
+
+# Creating Glue Jobs - Start
+  EcouponCampaign:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ecoupon"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ecoupon'
+      NumberOfWorkers: 6
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: campaign
+        BusinessFunction: ecoupon
+
+  EcouponArchiveCampaign:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Join
+          - ''
+          - - "s3://"
+            - !Ref S3ArtifactBucket
+            - '/Glue/Scripts/'
+            - !Ref AWSTeam
+            - "_ecoupon_archive_campaign"
+      Connections:
+        Connections:
+          - !Ref GlueConnector01replica
+      DefaultArguments:
+        --env: !Ref AWSEnv
+        --TempDir: !Sub 's3://${S3NameGlueTemporary}/'
+        --job-bookmark-option: job-bookmark-disable
+        --job-language: python
+        --enable-metrics: ''
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 0
+      Name: !Sub '${AWSTeam}_ecoupon_archive_campaign'
+      NumberOfWorkers: 2
+      Role: !Ref GlueIamRole
+      Timeout: 2880
+      WorkerType: G.1X
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: campaign
+        BusinessFunction: ecoupon
+# Creating Glue Jobs - Start
+
+# Campaign Related Workflow - Start
+  CampaignGlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - campaign
+          - turncate
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: campaign
+        BusinessFunction: campaign
+# Campaign Related Workflow - End
+
+# Campaign Related Trigger - Start
+  CampaignGlueTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref EcouponArchiveCampaign
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - campaign
+          - turncate
+          - schedule
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "SCHEDULED"
+      Schedule: cron(30 20 * * ? *)
+      StartOnCreation: true
+      WorkflowName: !Ref CampaignGlueWorkflow
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: campaign
+        BusinessFunction: campaign
+
+  EcouponTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AWSTeam
+          - ecoupon
+          - trigger
+          - !If
+            - IsNotPrd
+            - !Ref AWSEnv
+            - !Ref 'AWS::NoValue'
+      Type: "CONDITIONAL"
+      WorkflowName: !Ref CampaignGlueWorkflow
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref EcouponCampaign
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref EcouponArchiveCampaign
+            State: SUCCEEDED
+        Logical: AND
+      Tags:
+        application: !Ref AWSTeam
+        environment: !Ref AWSEnv
+        stack: campaign
+        BusinessFunction: campaign
+# Campaign Related Trigger - End

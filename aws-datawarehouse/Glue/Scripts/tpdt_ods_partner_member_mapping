@@ -1,0 +1,98 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-dw/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+
+
+
+## Source Extraction
+##source table : partner_member_mapping
+t_partner_member_mapping = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'partner_member_mapping', transformation_ctx = "member_activity_history")
+partner_member_mapping_df = t_partner_member_mapping.toDF()
+partner_member_mapping_df.createOrReplaceTempView("ods_partner_member_mapping")
+print("Source Extraxtion Finished: Partner_member_mapping...")
+
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member', transformation_ctx = "member")
+member_df = t_member.toDF()
+member_df.createOrReplaceTempView("member")
+
+print("Source Extraction Finished: Member...")
+
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+
+## Data Transformation
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+print("Perform data transformation...")
+
+ods_partner_member_mapping_v2 = spark.sql("""
+    select  
+        t1.mapping_id,
+        t1.created_by,
+        t1.created_date,
+        t1.status,
+        t1.updated_by,
+        t1.updated_date,
+        t2.member_id,
+        t1.partner_member_id,
+        -- t1.phone,
+        t1.phone_prefix,
+        t1.app_id
+    From ods_partner_member_mapping t1 
+    left join member t2 on t1.phone= t2.phone
+""")
+ods_partner_member_mapping_v2.createOrReplaceTempView("ods_partner_member_mapping_v2")
+
+
+## Loading Result to S3
+print("Saving Result into target destination...")
+
+ods_partner_member_mapping_v2.write.format('parquet').partitionBy("app_id").mode('overwrite').option("header",True).save(output_path)
+
+print(f"Result Saved in {output_path}...")
+
+
+job.commit()

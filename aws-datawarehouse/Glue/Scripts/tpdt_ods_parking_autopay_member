@@ -1,0 +1,78 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType 
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta 
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-parking/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-parking-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_autopay_"
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : carpark_members
+t_carpark_members = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'carpark_members', transformation_ctx = "carpark_members")
+carpark_members_df = t_carpark_members.toDF()
+carpark_members_df.createOrReplaceTempView("carpark_members")
+print("Source Extraxtion Finished: carpark_members...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+ods_parking_autopayment_member = spark.sql(''' 
+    SELECT id,  memid as member_id, outstanding_amt,    status_fc as status_freeze_contactless,
+    case when status_fa in (0,1) then status_fa  else NULL end as status_freeze_autopayment,
+    case when status_fa in (0,1) then 1
+         when status_fa in (2) then 0 else NULL end as status_enable_autopayment,
+    status_fm as status_freeze_member_function,
+    case when status_ps = 0 then 1
+         when status_ps = 1 then 0 else NULL end as status_all_payment_settled, created_at, updated_at
+    FROM carpark_members
+''')
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+ods_parking_autopayment_member.write.format('parquet').partitionBy("status_enable_autopayment").mode('overwrite').option("header",True).save(output_path)
+
+print(f"Result Saved in {output_path}...")
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

@@ -1,0 +1,261 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+district_tablename = 'tpdt_dim_tp_district_mapping.csv'
+
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    output_path="s3://tpdt-dw/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    district_mapping_s3_location = 's3://tpdt-dimension/tpdt_dim_tp_district_mapping/'+district_tablename
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    district_mapping_s3_location = 's3://tpdt-dimension-'+env+'/tpdt_dim_tp_district_mapping/'+district_tablename
+
+
+prefix="shkpmalls_vip_"
+
+
+
+## Source Extraction
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member', transformation_ctx = "member")
+member_df = t_member.toDF()
+member_df.createOrReplaceTempView("member")
+
+print("Source Extraction Finished: Member...")
+
+
+##source table : member_setting
+t_member_setting = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_setting', transformation_ctx = "member_setting")
+member_setting_df = t_member_setting.toDF()
+member_setting_df.createOrReplaceTempView("member_setting")
+
+print("Source Extraction Finished: member_setting...")
+
+
+##source table : member_mall_profile
+t_member_mall_profile = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_mall_profile', transformation_ctx = "member_mall_profile")
+member_mall_profile_df = t_member_mall_profile.toDF()
+member_mall_profile_df.createOrReplaceTempView("member_mall_profile")
+
+print("Source Extraxtion Finished: member_mall_profile...")
+
+
+## source table : member_level
+t_member_level = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'member_level', transformation_ctx = "member_level")
+member_level_df = t_member_level.toDF()
+member_level_df.createOrReplaceTempView("member_level")
+
+print("Source Extraction Finished: member_level...")
+
+
+## mapping table : dim_tp_district_mapping.csv from S3
+
+
+district_df = spark.read.csv(district_mapping_s3_location, header='true', inferSchema='true', sep=',')
+district_df.createOrReplaceTempView("ods_tp_district_mapping")
+
+print("Source Extraction Finished: ods_tp_district_mapping...")
+
+##source table : dim_mainlander_surename_list.csv
+dim_mainlander_surename_list_df = spark.read.csv(dimension_path + 'tpdt_dim_mainlander_surename_list/tpdt_dim_mainlander_surename_list.csv', header='true', inferSchema='true', sep=',').filter("English_Surname not in ('Liu','Mo','Kong','Ma')")
+dim_mainlander_surename_list_df.createOrReplaceTempView("dim_mainlander_surename_list")
+
+
+
+## Data Transformation
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+print("Perform data transformation...")
+
+
+dw_member = spark.sql("""
+select
+			 t1.member_id,
+			 t6.name_lang1 AS member_tier,
+		CASE	WHEN (t1.status = 'W') THEN 'Waiting for verification'
+				WHEN (t1.status = 'A') THEN 'Active'
+				WHEN (t1.status = 'L') THEN 'Locked'
+				WHEN (t1.status = 'S') THEN 'Suspended'
+				WHEN (t1.status = 'V') THEN 'Invalid'  
+				WHEN (t1.status = 'X') THEN 'Marked For Deletion' 
+				ELSE NULL END as  member_status_detail,
+			t1.registration_date as registration_datetime,
+			CAST(DATE_FORMAT(cast(t1.registration_date as TIMESTAMP) - INTERVAL 8 hours, 'yyyy-MM-dd') AS DATE) AS  registration_date ,
+			t1.update_date,
+
+			t1.phone_prefix  AS  mobile_prefix ,
+		CASE  WHEN t1.title = 1 THEN 'Male'
+			  WHEN t1.title IN (2,3) THEN  'Female' else  'Unknown' end as gender,
+
+		CASE  WHEN t1.title  = 1 THEN 'Mr.'
+			  WHEN t1.title  = 2 THEN 'Mrs.'
+			  WHEN t1.title  = 3 THEN 'Miss.' ELSE 'Unknown' END AS title ,
+
+			t1.age,
+
+		CASE   WHEN  t1.age BETWEEN 11 AND 17 THEN '11 - 17'
+			   WHEN  t1.age BETWEEN 18 AND 24 THEN '18 - 24'
+			   WHEN  t1.age BETWEEN 25 AND 34 THEN '25 - 34'
+			   WHEN  t1.age BETWEEN 35 AND 44 THEN '35 - 44'
+			   WHEN  t1.age BETWEEN 45 AND 54 THEN '45 - 54'
+			   WHEN  t1.age BETWEEN 55 AND 64 THEN '55 - 64'
+			   WHEN  t1.age BETWEEN 65 AND 74 THEN '65 - 74'
+			   WHEN  t1.age >= 75  THEN '75+' END  AS age_group	 ,
+
+		CASE  WHEN  t1.birth_mth = 1 THEN 'Jan'
+			  WHEN  t1.birth_mth = 2  THEN 'Feb'
+			  WHEN  t1.birth_mth = 3  THEN 'Mar'
+			  WHEN  t1.birth_mth = 4  THEN 'Apr'
+			  WHEN  t1.birth_mth = 5  THEN 'May'
+			  WHEN  t1.birth_mth = 6  THEN 'Jun'
+			  WHEN  t1.birth_mth = 7  THEN 'Jul'
+			  WHEN  t1.birth_mth = 8  THEN 'Aug'
+			  WHEN  t1.birth_mth = 9  THEN 'Sep'
+			  WHEN  t1.birth_mth = 10 THEN 'Oct'
+			  WHEN  t1.birth_mth = 11 THEN 'Nov'
+			  WHEN  t1.birth_mth = 12 THEN 'Dec'  END AS birthday_month,
+
+			  -- Data Log id: 2
+			 case when t1.city_lang1 like '%China%' then 'Mainland'
+			      when t1.city_lang1 like '%Mainland%' then 'Mainland'
+			      else  t1.country_lang1 end AS residence,
+
+
+			 t2.district_name AS district,
+			 t2.`district_name_c&s` AS district_cs,
+
+		CASE  WHEN t3.default_language  = 1 THEN 'English'
+			  WHEN t3.default_language  = 2 THEN 'Traditional Chinese'
+			  WHEN t3.default_language  = 3 THEN 'Simplified Chinese' ELSE 'Unknown' END  AS `default_language`,
+
+			t1.referrer AS referrer                    ,
+			smallint(t3.receive_promotion_msg) AS optin_msg      ,
+			smallint(t3.receive_promotion_sms) AS optin_sms      ,
+			smallint(t3.receive_promotion_email) AS optin_email  ,
+			smallint(t3.receive_promotion_mail) AS optin_mail    ,
+			smallint(t3.receive_promotion_call) AS optin_call
+
+
+
+		From member t1
+		left join ods_tp_district_mapping t2 on t1.district= CAST(t2.district as int)
+		left join member_setting t3 on t1.member_id=t3.member_id
+		left join member_mall_profile t5 on t1.member_id=t5.member_id
+		left join member_level  t6  on t5.member_level_id =  t6.member_level_id
+		where t1.member_id<>'SHKP0519009'
+""")
+dw_member.createOrReplaceTempView("dw_member")
+
+## for deleted member
+dw_member_final = spark.sql("""
+select
+			 member_id,
+			 member_tier,
+			 member_status_detail,
+			 registration_datetime,
+			 registration_date,
+			 update_date,
+			 mobile_prefix,
+			 case when member_status_detail = 'Invalid' then null else gender end as gender,
+			 case when member_status_detail = 'Invalid' then null else title end as title,
+			 case when member_status_detail = 'Invalid' or age > 99 then null else age end as age,
+			 case when member_status_detail = 'Invalid' then null else birthday_month end as birthday_month,
+			 residence,
+			 district,
+			 district_cs,
+			 default_language,
+			 referrer,
+			 optin_msg,
+			 optin_sms,
+			 optin_email,
+			 optin_mail,
+			 optin_call,
+			 case when member_status_detail = 'Invalid' or age > 99 then 'undefined' else age_group end as age_group
+		From dw_member
+""")
+dw_member_final.createOrReplaceTempView("dw_member_final")
+
+
+staging_member = dw_member_final.select(col('member_id').alias('mapping_member_id'),
+                                 'member_tier',
+                                 'member_status_detail',
+                                 'gender',
+                                 'age',
+                                 'age_group',
+                                 'district',
+                                 'district_cs',
+                                 'residence',
+                                 'registration_date',
+                                 'registration_datetime')
+
+
+member_resident_group_staging_df = spark.sql("""
+    Select Distinct mem.member_id,
+           Case when residence = 'Hong Kong SAR' and (default_language = 'Simplified Chinese' or mobile_prefix = '86' or surname1.English_Surname is not NULL or surname2.English_Surname is not NULL) THEN 'HK-Based mainlander'
+                when residence = 'Hong Kong SAR' THEN 'HK-Based local'
+                else residence
+                end as residence
+    From dw_member mem
+    inner join member m on m.member_id = mem.member_id
+    left join dim_mainlander_surename_list surname1 on m.first_name_lang1 = surname1.English_Surname
+    left join dim_mainlander_surename_list surname2 on m.last_name_lang1 = surname2.English_Surname
+""")
+member_resident_group_staging_df.createOrReplaceTempView("member_resident_group_staging_df")
+
+member_resident_group_df = spark.sql("""
+    Select member_id,
+           case when residence IN ('Macau SAR' ,'Taiwan','Others','Undefined') then 'Others'  when  residence in ('China', 'Mainland') then 'Mainland tourist' else  residence end as Residence_Group
+    from member_resident_group_staging_df
+""")
+
+
+
+## Loading Result to S3
+print("Saving Result into target destination...")
+member_output_path=output_path+table_name+"/"
+dw_member_final.write.format('parquet').mode('overwrite').partitionBy("age_group").option("header",True).save(member_output_path)
+print(f"Result Saved in {output_path}...")
+
+staging_output_path = staging_path + 'tpdt_staging_member/'
+staging_member.write.format('parquet').mode('overwrite').partitionBy("age_group").option("header",True).save(staging_output_path)
+print(f"Result Saved in {staging_output_path}...")
+
+resident_output_path = output_path + 'tpdt_staging_member_resident_group/'
+member_resident_group_df.write.format('parquet').mode('overwrite').partitionBy("Residence_Group").option("header",True).save(resident_output_path)
+print(f"Result Saved in {resident_output_path}...")
+
+job.commit()

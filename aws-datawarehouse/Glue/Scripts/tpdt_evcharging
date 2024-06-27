@@ -1,0 +1,81 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import date
+import re
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-staging/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-staging-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+s3 = boto3.resource('s3')
+my_bucket = s3.Bucket('tpdt-data-from-cdp')
+
+
+def move_object(s3_object_path, destination_path):
+    source = {'Bucket': 'tpdt-data-from-cdp',
+              'Key': s3_object_path}
+    target = s3.Bucket('tpdt-parking')
+    target.copy(source, destination_path)
+    s3.Object('tpdt-data-from-cdp', s3_object_path).delete()
+
+
+for my_bucket_object in my_bucket.objects.all():
+    object_path = my_bucket_object.key
+    if object_path.startswith('ev_charging/charger/ev') and object_path.endswith('.json'):
+        renamed_file = re.sub(r'ev_charger_\d{8}_', 'ev_charger_', object_path)
+        new_key = renamed_file.replace('ev_charging/charger/', 'tpdt_ev_charger_raw/')
+        move_object(object_path, new_key)
+    elif object_path.startswith('ev_charging/payment/ev') and object_path.endswith('.json'):
+        new_key = object_path.replace('ev_charging/payment/', 'tpdt_ev_payment_raw/')
+        move_object(object_path, new_key)
+    elif object_path.startswith('ev_charging/rsr_status/ev') and object_path.endswith('.json'):
+        new_key = object_path.replace('ev_charging/rsr_status/', 'tpdt_ev_rsr_raw/')
+        move_object(object_path, new_key)
+    elif object_path.startswith('ev_charging/transaction/ev') and object_path.endswith('.json'):
+        new_key = object_path.replace('ev_charging/transaction/', 'tpdt_ev_transaction_raw/')
+        move_object(object_path, new_key)
+    else:
+        pass
+
+

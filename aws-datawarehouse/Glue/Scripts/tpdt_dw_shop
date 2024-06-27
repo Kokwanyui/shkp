@@ -1,0 +1,247 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db03 = "tpdt_03dw"
+    db02 = "tpdt_02replica"
+    output_path = "s3://tpdt-dw/" + table_name + "/"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    output_path = "s3://tpdt-dw-" + env + "/" + table_name + "/"
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+
+prefix = "shkpmalls_vip_"
+cms_prefix = "shkpmalls_cms_"
+dimension_prefix = "bi_dimension_"
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : shop
+t_shop = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'shop',
+                                                       transformation_ctx="shop")
+shop_df = t_shop.toDF()
+shop_df.createOrReplaceTempView("shop")
+print("Source Extraction Finished: Shop...")
+
+##source table : mall
+t_mall = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + 'mall',
+                                                       transformation_ctx="mall")
+mall_df = t_mall.toDF()
+mall_df.createOrReplaceTempView("mall")
+print("Source Extraction Finished: Mall...")
+
+# -----------------previous source
+##mapping table : dim_lms_mapping.csv from S3
+# lms_mapping_df = spark.read.csv(dimension_path+'tpdt_dim_lms_mapping/tpdt_dim_lms_mapping.csv', header='true', inferSchema='true', sep=';')
+# lms_mapping_df.createOrReplaceTempView("dim_lms_mapping")
+# print("Source Extraction Finished: ods_lms_mapping...")
+
+
+## mapping table : dim_cms_lms_mapping.csv from S3
+# cmslms_mapping_df = spark.read.csv(dimension_path+'tpdt_dim_cms_lms_mapping/tpdt_dim_cms_lms_mapping.csv', header='true', inferSchema='true', sep=';')
+# cmslms_mapping_df.createOrReplaceTempView("dim_cms_lms_mapping")
+# print("Source Extraction Finished: ods_tp_mall_mapping...")
+
+
+## mapping table : dim_tp_mall_mapping.csv from S3
+# mall_mapping_df = spark.read.csv(dimension_path+'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv', header='true', inferSchema='true', sep=',')
+# mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+# print("Source Extraction Finished: dim_tp_mall_mapping...")
+
+# -----------------new source
+t_lms_mapping = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                              table_name=dimension_prefix + 'dim_lms_mapping',
+                                                              transformation_ctx="dim_lms_mapping")
+lms_mapping_df = t_lms_mapping.toDF()
+lms_mapping_df.createOrReplaceTempView("dim_lms_mapping")
+
+t_cmslms_mapping = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                                 table_name=dimension_prefix + 'dim_cms_lms_mapping',
+                                                                 transformation_ctx="dim_cms_lms_mapping")
+cmslms_mapping_df = t_cmslms_mapping.toDF()
+cmslms_mapping_df.createOrReplaceTempView("dim_cms_lms_mapping")
+
+t_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                               table_name=dimension_prefix + 'dim_mall_mapping',
+                                                               transformation_ctx="dim_mall_mapping")
+mall_mapping_df = t_mall_mapping.toDF()
+mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+# -----------------new source
+
+##source table : cms_shop
+t_cms_shop = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=cms_prefix + 'shop',
+                                                           transformation_ctx="cms_shop")
+cms_shop_df = t_cms_shop.toDF()
+cms_shop_df.createOrReplaceTempView("cms_shop")
+print("Source Extraxtion Finished: shop...")
+
+##source table : cms_shop_cat
+t_cms_shop_cat = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=cms_prefix + 'shop_cat',
+                                                               transformation_ctx="cms_shop_cat")
+cms_shop_cat_df = t_cms_shop_cat.toDF()
+cms_shop_cat_df.createOrReplaceTempView("cms_shop_cat")
+print("Source Extraxtion Finished: shop_cat...")
+
+##source table : rfm_cat
+t_rfm_cat = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                          table_name=dimension_prefix + 'dim_cms_trade_cat_for_rfm',
+                                                          transformation_ctx="rfm_cat")
+rfm_cat_df = t_rfm_cat.toDF()
+rfm_cat_df.createOrReplaceTempView("rfm_cat")
+print("Source Extraxtion Finished: rfm_cat...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+print("Perform data transformation...")
+
+tpdt_dw_shop = spark.sql("""
+		SELECT t1.shop_id  
+			,t1.status AS shop_status
+			, CASE  WHEN  t1.status = 'A'  THEN 'Active'
+					WHEN  t1.status = 'I'  THEN 'Inactive'
+					WHEN  t1.status = 'V'  THEN 'Invalid' ELSE NULL END AS shop_status_detail
+			,t1.visible AS shop_visible
+			, CASE  WHEN  t1.visible = 'V'  THEN 'Visible'
+					WHEN  t1.visible = 'I'  THEN 'Invisible' ELSE NULL END AS shop_visible_detail
+			  ,  REPLACE(REPLACE(t1.name_lang1, '
+		', ''),
+					'
+					',
+					'') AS shop_name 
+			,t1.floor  
+			, CASE  WHEN (RIGHT(t1.shop_no, 1) = ',') THEN LEFT(t1.shop_no, (LENGTH(t1.shop_no) - 1)) ELSE t1.shop_no END AS unit_no
+			,t3.team  
+			,t2.mall_id  
+			,t2.status AS mall_status
+			, CASE  WHEN (t2.status = 'A') THEN 'Active'
+					WHEN (t2.status = 'I') THEN 'Inactive'
+					WHEN (t2.status = 'V') THEN 'Invalid' ELSE NULL END AS mall_status_detail
+			,t3.property_id  
+			,REPLACE(REPLACE(t2.name_lang1, '
+		', ''), '
+					', '') AS mall_name
+			,REPLACE(REPLACE(t1.phase_lang1, '
+		', ''), '
+					', '') AS mall_phase
+			,t1.join_member_promotion_plan AS join_the_point_program
+			,t1.refund_policy_provided  
+			,t1.join_ecoupon_usage AS join_shop_gift
+			,t1.join_point_dollar
+			,t1.join_master_ecoupon_usage AS join_SHKP_mall_egift_cert
+			,t1.ecoupon_shop_name AS SHKP_mall_egift_cert_merchant_name
+			,t1.email AS SHKP_mall_egift_cert_merchant_email
+			,t1.passcode AS QR_code
+ 			,t5.Agreement_No AS lms_agreement_no
+			,t5.Main_Unit_No AS lms_unit_no
+			,t5.Trade_Name AS lms_trade_name
+			,t5.Standard_Brand_Name_Eng AS lms_standard_brand_name
+			,CASE WHEN t5.Standard_Trade_Category IS NULL OR t5.Standard_Trade_Category = '' OR t5.Standard_Trade_Category = ' ' OR t5.Standard_Trade_Category = 'To Be Confirmed' THEN 'UNDEFINABLE' ELSE t5.Standard_Trade_Category END AS lms_standard_trade_category
+			,t5.Standard_Group AS lms_standard_group
+			,t5.Charge_Area AS lms_charge_area
+			,t5.Standard_Trade_Mix AS lms_trade_mix
+            ,t5.Standard_Sub_Trade_Mix AS lms_subtrade_mix
+
+		FROM
+
+		shop t1
+		INNER JOIN  mall t2 ON  t2.mall_id = t1.mall_id
+		INNER JOIN  dim_tp_mall_mapping t3 ON t3.mall_id = t2.mall_id
+ 		LEFT JOIN (
+				SELECT
+				 k1.shop_id
+				,k1.shop_status
+				,k1.shop_status_detail
+				,k1.property_id
+				,k1.unit_no
+				,k1.shop_name
+				,k1.lms_property_id
+				,k1.main_unit_no
+				,k1.Standard_Brand_Name_Eng
+				,k1.lms_agreement_no
+				,k1.Updated_Month
+				FROM   dim_cms_lms_mapping k1 INNER JOIN (
+					SELECT  shop_id ,MAX(Updated_Month) AS max_LMS_last_updted_month
+					FROM  dim_cms_lms_mapping
+					GROUP BY shop_id
+				) k2 ON   k2.shop_id = k1.shop_id  AND  k2.max_LMS_last_updted_month = k1.Updated_Month
+
+		  ) t4 ON  t1.shop_id = t4.shop_id
+        LEFT JOIN  dim_lms_mapping t5 ON  t5.Agreement_No = t4.lms_agreement_no
+		ORDER BY t1.mall_id ,t1.shop_id
+""")
+
+staging_shop = tpdt_dw_shop.select(col('shop_id').alias('mapping_shop_id'),
+                                   'shop_name',
+                                   'property_id',
+                                   'mall_id',
+                                   'team',
+                                   'lms_agreement_no',
+                                   'lms_trade_name',
+                                   'lms_standard_brand_name',
+                                   'lms_standard_trade_category',
+                                   'lms_standard_group',
+                                   'lms_trade_mix',
+                                   'lms_charge_area',
+                                   'lms_subtrade_mix')
+
+cms_shop_cat = spark.sql("""
+SELECT 
+    t1.ID as cms_shop_id, 
+    t1.SHOP_NAME_EN as cms_shop_name,
+    t1.mall_id, 
+    t1.DISPLAY_MAIN_CAT as app_display_cat_id, 
+    t2.CATEGORY_NAME_EN as app_display_cat_name
+FROM cms_shop t1
+left join cms_shop_cat t2 on t1.DISPLAY_MAIN_CAT = t2.ID
+where t1.status = 1
+""")
+
+# Transformation 2: Join CMS tradw cat with rfm cat (defined by CRM Team)
+cms_shop_cat_for_rfm = cms_shop_cat.join(rfm_cat_df, cms_shop_cat.app_display_cat_name == rfm_cat_df.cms_trade_cat,
+                                         how="left") \
+    .select('cms_shop_id', 'cms_shop_name', 'mall_id', 'app_display_cat_id', 'app_display_cat_name', 'rfm_trade_cat')
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+
+tpdt_dw_shop.write.format('parquet').mode('overwrite').option("header", True).save(output_path)
+
+staging_output_path = staging_path + 'tpdt_staging_shop/'
+staging_shop.write.format('parquet').mode('overwrite').option("header", True).save(staging_output_path)
+
+cms_shop_cat_output_path = f"{staging_path}tpdt_cms_trade_cat_for_rfm/"
+cms_shop_cat_for_rfm.write.format('parquet').mode('overwrite').option("header", True).save(cms_shop_cat_output_path)
+
+job.commit()
+

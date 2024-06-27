@@ -1,0 +1,211 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db03 = "tpdt_03dw"
+    db02 = "tpdt_02replica"
+    output_path = "s3://tpdt-parking/" + table_name + "/"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    output_path = "s3://tpdt-parking-" + env + "/" + table_name + "/"
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+
+prefix = "carpark_data_"
+if env == 'dev':
+    carpark_bi_prefix = "shkpmalls_carpark_bi_"
+else:
+    carpark_bi_prefix = "shkpmalls_carpark_"
+    dimension_prefix = "bi_dimension_"
+
+prefix03 = "tpdt_"
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_vip_member', transformation_ctx = "member")
+member_df = t_member.toDF().select(col('member_id').alias('memberId')).filter("status = 'V'")
+member_df.createOrReplaceTempView("member")
+print("Source Extraction Finished: Member...")
+
+##source table : redemption
+t_raw = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                      table_name=dimension_prefix + 'carpark_sftp_redemption',
+                                                      transformation_ctx="carpark_sftp_redemption")
+raw_df = t_raw.toDF() \
+    .select(lit(9999999999).alias('row_no'),
+            concat(date_format('car_in_datetime', 'yyyy-MM-dd HH:mm:'), lit('00')).cast(TimestampType()).alias('car_in_datetime'),
+            concat(date_format('car_out_datetime', 'yyyy-MM-dd HH:mm:'), lit('00')).cast(TimestampType()).alias('car_out_datetime'),
+            trim(col('car_plate')).alias('car_plate'),
+            'member_id',
+            lit('').alias('parking_entry_id'),
+            'property_id',
+            col('property_id').alias('carpark_id'),
+            'redeemed_minute',
+            'redeemed_parking_fee',
+            concat(date_format('redemption_datetime', 'yyyy-MM-dd HH:mm:'), lit('00')).cast(TimestampType()).alias('redemption_datetime'),
+            trim(col('redemption_type')).alias('redemption_type')) \
+    .filter("property_id != ''") \
+    .na.fill("") \
+    .distinct()
+print("Source Extraction Finished: carpark_sftp_redemption...")
+
+## mapping table : dim_carpark_list.csv
+if env == 'prod':
+    t_carpark_list = glueContext.create_dynamic_frame.from_catalog(database=db02,
+                                                                   table_name=dimension_prefix + 'dim_carpark_list',
+                                                                   transformation_ctx="dim_carpark_list")
+    carpark_list_raw_df = t_carpark_list.toDF()
+else:
+    carpark_list_raw_df = spark.read.csv(dimension_path + 'tpdt_dim_carpark_list/tpdt_dim_carpark_list.csv',
+                                         header='true', inferSchema='true', sep=',')
+
+carpark_list_df = carpark_list_raw_df.select(col('table_title')) \
+    .filter("table_type = 'redemption'")
+print("Source Extraxtion Finished: dim_carpark_list.csv...")
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+tables = [str(row.table_title) for row in carpark_list_df.collect()]
+for table in tables:
+    t_parking = glueContext.create_dynamic_frame.from_catalog(database=db01, table_name=prefix + table,
+                                                              transformation_ctx=prefix + table)
+    parking_df = t_parking.toDF() \
+        .select(lit(9999999999).alias('row_no'),
+                'car_in_datetime',
+                'car_out_datetime',
+                trim(col('car_plate')).alias('car_plate'),
+                'member_id',
+                lit('').alias('parking_entry_id'),
+                'property_id',
+                col('property_id').alias('carpark_id'),
+                'redeemed_minute',
+                'redeemed_parking_fee',
+                'redemption_datetime',
+                trim(col('redemption_type')).alias('redemption_type'))
+    raw_df = raw_df.union(parking_df).distinct()
+
+raw_df.persist()
+
+carpark_id_map = {
+    "LMN": "LN",
+    "MIKIKI": "MKK",
+    "VCITY": "VCY",
+    "YOHO1": "YM1",
+    "YOHO2": "YM2",
+    "VWALK": "VWK",
+    "Park Central": "PC",
+    "New Town Plaza I": "NTP1",
+    "New Town Plaza III": "NTP3",
+    "East Point City": "EPC",
+    "Metro Plaza": "MP",
+    "Landmark North": "LN",
+    "Tai Po Mega Mall": "TPMM",
+    "Tsuen Wan Plaza": "TWP",
+    "YOHO MALL I": "YM1",
+    "YOHO MALL II": "YM2",
+    "Yuen Long Plaza": "YLP",
+    "Harbour North Phase 1": "HN1",
+    "Harbour North Phase 2": "HN2",
+    "Harbour North Phase 3": "HN3",
+    "HomeSquare": "HS",
+    "Metropolis Plaza": "MPP",
+    "Chelsea Heights": "CH",
+    "PopWalk2": "PW2",
+    "PopWalk3": "PW3",
+    "OceanPopWalk": "OPW"
+}
+
+property_id_map = {
+    "LMN": "LN",
+    "MIKIKI": "MKK",
+    "NTP1": "NTP",
+    "NTP3": "NTP",
+    "VCITY": "VCY",
+    "YOHO1": "YM",
+    "YOHO2": "YM",
+    "VWALK": "VWK",
+    "HN1": "HN",
+    "HN2": "HN",
+    "HN3": "HN",
+    "OPW": "PW",
+    "PW2": "PW",
+    "PW3": "PW"
+}
+
+carpark_id_map_df = spark.createDataFrame(carpark_id_map.items(), schema=StructType(fields=[
+    StructField("mapping_carparkid_2", StringType()),
+    StructField("adjusted_carparkid2", StringType())]))
+property_id_map_df = spark.createDataFrame(property_id_map.items(), schema=StructType(fields=[
+    StructField("mapping_property_id", StringType()),
+    StructField("adjusted_property_id", StringType())]))
+
+
+parking_redemption_df = raw_df.join(carpark_id_map_df,
+                                    upper(raw_df.carpark_id) == upper(carpark_id_map_df.mapping_carparkid_2),
+                                    how='left') \
+    .join(property_id_map_df, upper(raw_df.property_id) == upper(property_id_map_df.mapping_property_id), how='left') \
+    .join(member_df, upper(raw_df.member_id) == upper(member_df.memberId), how='left') \
+    .withColumn('carpark_id_entry',
+                when(col('adjusted_carparkid2').isNotNull(), col('adjusted_carparkid2')).otherwise(col('carpark_id'))) \
+    .withColumn('property_id_entry',
+                when(col('adjusted_property_id').isNotNull(), col('adjusted_property_id')).otherwise(
+                    col('property_id'))) \
+    .withColumn('car_plate_final',
+                when(col('memberId').isNotNull() & col('car_plate').isNotNull(), sha2(upper(col('car_plate')), 256)).otherwise(col('car_plate'))) \
+    .select('row_no',
+            'car_in_datetime',
+            'car_out_datetime',
+            col('car_plate_final').alias('car_plate'),
+            'member_id',
+            'parking_entry_id',
+            col('property_id_entry').alias('property_id'),
+            col('carpark_id_entry').alias('carpark_id'),
+            'redeemed_minute',
+            'redeemed_parking_fee',
+            'redemption_datetime',
+            'redemption_type')\
+    .filter("year(car_in_datetime)>=2018")
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+parking_redemption_df.write.format('parquet').mode('overwrite').partitionBy("carpark_id").option("header", True).save(output_path)
+print(f"Result Saved in {output_path}...")
+
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

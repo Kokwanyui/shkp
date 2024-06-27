@@ -1,0 +1,110 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import col,from_json, regexp_replace, json_tuple, expr, explode
+import pandas as pd
+import numpy as np
+import json
+
+
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-staging/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-staging-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+
+
+#spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+
+## Source Extraction
+##source table : gift
+t_gift = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'gift', transformation_ctx = "gift")
+gift_df = t_gift.toDF()
+print("Source Extraxtion Finished: gift...")
+
+## Data Transformation
+gift_staging_df = gift_df.select('gift_id','mall_id','status','created_date', 'extra_function', 'type','reserve_expiry_day','reserve_expiry_date','unlimited_inventory', 
+                            'name_lang1','name_lang2','name_lang3','value_amount','face_value','gift_category_id')\
+                            .where("reserve_expiry_date is null or year(reserve_expiry_date) > 1900")
+
+
+json_df = gift_df.select(col('gift_id').alias('mapping_gift_id'), 'redeem_bonus_points', 'redeem_with_cash', 'redeem_bonus_points_with_cash', 'extra_data')
+#print("Transformation: Dropped Columns")
+#print(gift_dyf.printSchema())
+
+
+## Unnest Json in columns
+json_df = json_df.toPandas()
+json_df['extra_data'] = '['+ json_df['extra_data'].astype(str) + ']'
+columns_in_json = ['redeem_bonus_points', 'extra_data']
+rows = len(json_df)
+
+for column in columns_in_json:
+    for row in range(rows):
+        try:
+            internal = json.loads(json_df[column][row])
+            number_of_keys = len(internal)
+            for key in range(number_of_keys):
+                for fish in internal[key].keys():
+                    if (fish == 'car_park_redeem_hours') or (fish == 'car_park_min_spending_amount'):
+                        json_df.loc[row, fish] = str(internal[key][fish])
+                    else:
+                        column_key = str(key + 1)
+                        column_name = fish + '_{}'.format(column_key)
+                        json_df.loc[row, column_name] = str(internal[key][fish])
+        except:
+            pass
+
+
+json_df =json_df.replace(np.NaN, '')
+print(json_df.info())
+print("Transformation: Unnested Json")
+
+json_df = json_df.drop(columns = ['redeem_bonus_points', 'redeem_with_cash', 'redeem_bonus_points_with_cash', 'extra_data'])
+json_sparkdf=spark.createDataFrame(json_df)\
+                  .withColumn('bonus_point_1', trim(regexp_replace(col('bonus_point_1'), ",", "")).cast(DoubleType()))
+
+gift_staging_df = gift_staging_df.join(json_sparkdf, gift_staging_df.gift_id == json_sparkdf.mapping_gift_id, how='left').drop('mapping_gift_id')
+
+## Loading Result to S3
+print("Saving Result into target destination...")
+gift_staging_df.write.format('parquet').mode('overwrite').option("header",True).save(output_path)
+#gift_df.to_csv(output_path,index=False , sep=',')
+#sparkDF.write.option("sep",";").option("header","true").csv(output_path)
+print(f"Result Saved in {output_path}...")
+

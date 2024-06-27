@@ -1,0 +1,73 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import udf, col
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType 
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta 
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-dw/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+prefix="shkpmalls_push_"
+
+
+
+## Source Extraction
+##source table : device_info
+t_device_info = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'device_info', transformation_ctx = "device_info")
+device_info_df = t_device_info.toDF()
+print("Source Extraxtion Finished: device_info...")
+
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+hk_time = datetime.now() - timedelta(hours=16)
+ytd = hk_time.date().strftime('%Y-%m-%d')
+
+
+delta = device_info_df.filter(f"to_date(updated_date) = '{ytd}' or to_date(created_date) = '{ytd}'")\
+                      .withColumn("sim_card_country_code",col("sim_card_country_code").cast(StringType()))\
+                      .withColumn("sim_card_serial_number",col("sim_card_serial_number").cast(StringType()))
+
+## Loading Result to S3
+print("Saving Result into target destination...")
+
+device_info_df.write.format('parquet').partitionBy("device_os_version").mode('overwrite').option("header",True).save(output_path)
+delta.write.format('parquet').mode('append').option("header",True).save('s3://tpdt-staging/tpdt_log_member_device/')
+print(f"Result Saved in {output_path}...")
+
+
+job.commit()

@@ -1,0 +1,74 @@
+variables:
+    AWSTeam: tpdt
+    ver: '202002281728' #cloud formation change set name, suggest use current datetime
+
+
+
+stages:
+    - workflow
+    - S3Artifacts
+    - UploadFiles
+    - PreValidation
+    - DeployEnvStack
+
+
+workflow:
+    rules:
+    - if: '$CI_COMMIT_REF_NAME == "dev"'
+      variables:
+        awsEnv: "dev"
+        DEPLOY_ENV: "develpoment"
+        AWS_CLI_PROFILE: "shkpmalls-dev"
+        AWS_CLI_REGION: "ap-east-1"
+        AUTO_DEPLOY: "enable"
+        Env_Prefix: "shkp-"
+    - if: '$CI_COMMIT_REF_NAME == "uat"'
+      variables:
+        awsEnv: "uat"
+        DEPLOY_ENV: "uat"
+        AWS_CLI_PROFILE: "shkpmalls-situat"
+        AWS_CLI_REGION: "ap-east-1"
+        AUTO_DEPLOY: "enable"
+        Env_Prefix: "shkp-"
+    - if: '$CI_COMMIT_REF_NAME == "prod"'
+      variables:
+        awsEnv: "prod"
+        DEPLOY_ENV: "production"
+        AWS_CLI_PROFILE: "shkpmalls-prod"
+        AWS_CLI_REGION: "ap-east-1"
+        AUTO_DEPLOY: "enable"
+        Env_Prefix: "shkp-"
+
+create-s3-artifacts-busket:
+    stage: S3Artifacts
+
+    script:
+      - sh ./CICD/Full_deployment/artifacts_bucket.sh ${AWSTeam} ${awsEnv} ${AWS_CLI_REGION} ${AWS_CLI_PROFILE}
+    tags:
+      - gitlab-runner-aws-tpdt
+
+Upload-files-from_git:
+    stage: UploadFiles
+
+    script:
+      - aws s3 cp ./ s3://${AWSTeam}-artifacts-${awsEnv}/ --recursive --exclude ".git*"  --profile ${AWS_CLI_PROFILE} --region ${AWS_CLI_REGION}
+    tags:
+      - gitlab-runner-aws-tpdt
+
+pre-validate-stacks:
+  stage: PreValidation
+
+  script:
+    - aws cloudformation validate-template --template-url https://${AWSTeam}-artifacts-${awsEnv}.s3.${AWS_CLI_REGION}.amazonaws.com/${Env_Prefix}${AWSTeam}-${awsEnv}-stack.yml --profile ${AWS_CLI_PROFILE} --region ${AWS_CLI_REGION}
+  tags:
+    - gitlab-runner-aws-tpdt
+
+create-stack-in-env:
+    stage: DeployEnvStack
+
+    script:
+      - aws cloudformation create-stack --stack-name ${Env_Prefix}${AWSTeam}-${awsEnv}-stack --template-url https://${AWSTeam}-artifacts-${awsEnv}.s3.${AWS_CLI_REGION}.amazonaws.com/${Env_Prefix}${AWSTeam}-${awsEnv}-stack.yml --profile ${AWS_CLI_PROFILE} --region ${AWS_CLI_REGION}
+    tags:
+      - gitlab-runner-aws-tpdt
+
+

@@ -1,0 +1,270 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone, timedelta
+from pyspark.sql import Row, Window
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+spark.conf.get("spark.sql.autoBroadcastJoinThreshold")
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01 = "tpdt_01replica"
+    db03 = "tpdt_03dw"
+    db02 = "tpdt_02replica"
+    db03sub = "tpdt_03sub"
+    db03fd = "tpdt_03foodordering"
+    db03redshift = "tpdt_03redshift"
+    output_path = "s3://tpdt-adhoc/" + table_name + "/"
+    staging_path = "s3://tpdt-staging/"
+    dimension_path = "s3://tpdt-dimension/"
+    foodorder_path = "s3://tpdt-foodordering/"
+    db03adhoc = "tpdt_03adhoc"
+else:
+    db01 = "tpdt_01replica_" + env
+    db03 = "tpdt_03dw_" + env
+    db03sub = "tpdt_03sub_" + env
+    db03fd = "tpdt_03foodordering" + env
+    output_path = "s3://tpdt-dw-" + env + "/" + table_name + "/"
+    staging_path = "s3://tpdt-staging-" + env + "/"
+    dimension_path = "s3://tpdt-dimension-" + env + "/"
+    foodorder_path = "s3://tpdt-foodordering-" + env + "/"
+
+dimension_prefix = "bi_dimension_"
+prefix = "shkpmalls_vip_"
+prefix03 = "tpdt_"
+
+# spending
+try:
+    delta_date = ((datetime.today() + timedelta(hours=8)) - timedelta(days=90)).strftime('%Y-%m-%d')
+    print(delta_date)
+    print(datetime.today())
+
+    t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database=db03, table_name=prefix03 + 'dw_spending', transformation_ctx="dw_spending")
+    dw_spending_df = t_dw_spending.toDF().filter(f"receipt_transaction_date >= '{delta_date}'")
+    print("Source Extraxtion Finished: db03_dw_spending...")
+
+    pre_action = f"delete from dw.dw_spending where dw.dw_spending.receipt_transaction_date >= '{delta_date}';"
+    glueContext.write_dynamic_frame.from_catalog(
+                                                frame=DynamicFrame.fromDF(dw_spending_df, glueContext, "full_load"),
+                                                database="tpdt_03redshift",
+                                                table_name="tpdt_dw_dw_spending",
+                                                catalog_connection="tpdt-03redshift-connector",
+                                                redshift_tmp_dir="s3://tpdt-athena-queryresult",
+                                                transformation_ctx="tpdt_dw_dw_spending",
+                                                additional_options={"preactions": pre_action}
+                                            )
+    print("Inserted to redshift tpdt_dw_dw_spending...")
+
+except:
+    print("Started except")
+
+    ##mapping table : member
+    t_member_staging = glueContext.create_dynamic_frame.from_catalog(database=db03sub, table_name=prefix03 + 'staging_member', transformation_ctx="staging_member")
+    member_df = t_member_staging.toDF()
+    print("Source Extraxtion Finished: member...")
+
+    ##mapping table : shop
+    t_shop = glueContext.create_dynamic_frame.from_catalog(database=db03sub, table_name=prefix03 + 'staging_shop', transformation_ctx="staging_shop")
+    shop_df = t_shop.toDF().drop('team', 'property_id', 'mall_id')
+    print("Source Extraxtion Finished: shop...")
+
+    ##source extration : tpdt_dw_dw_spending from redshift
+    t_dw_spending = glueContext.create_dynamic_frame.from_catalog(
+                                                                    database="tpdt_03redshift",
+                                                                    table_name='tpdt_dw_dw_spending',
+                                                                    redshift_tmp_dir="s3://tpdt-athena-queryresult",
+                                                                    transformation_ctx="tpdt_dw_dw_spending"
+                                                                )
+    print("Source Extraction Finished: db03redshit_tpdt_dw_dw_spending...")
+
+    dw_spending_df_raw = t_dw_spending.toDF().drop('member_status_detail', 'registration_date', 'gender', 'age', 'age_group', 'residence', 'district', 'district_cs', 'member_tier', 'shop_name', 'lms_agreement_no', 'lms_trade_name', 'lms_standard_brand_name', 'lms_standard_trade_category', 'lms_standard_group', 'lms_charge_area')
+
+    dw_spending_df_raw = dw_spending_df_raw.join(member_df, dw_spending_df_raw.member_id == member_df.mapping_member_id, how='left')\
+                                           .join(shop_df, dw_spending_df_raw.shop_id == shop_df.mapping_shop_id, how='left')
+
+    dw_spending_df = dw_spending_df_raw.select('receipt_id',
+                                               'invoice_no',
+                                               'receipt_status_detail',
+                                               'created_by',
+                                               'receipt_upload_datetime',
+                                               'receipt_upload_date',
+                                               'receipt_transaction_datetime',
+                                               'receipt_transaction_date',
+                                               'spending_transaction_id',
+                                               'approve_or_reject_by',
+                                               'approve_or_reject_datetime',
+                                               'approve_or_reject_date',
+                                               'reject_reason',
+                                               'receipt_type_detail',
+                                               'mall_id',
+                                               'property_id',
+                                               'team',
+                                               'member_id',
+                                               'member_status_detail',
+                                               'registration_date',
+                                               'gender',
+                                               'age',
+                                               'age_group',
+                                               'residence',
+                                               'district',
+                                               'district_cs',
+                                               'member_tier',
+                                               'shop_id',
+                                               'shop_name',
+                                               'lms_agreement_no',
+                                               'lms_trade_name',
+                                               'lms_standard_brand_name',
+                                               'lms_standard_trade_category',
+                                               'lms_standard_group',
+                                               'lms_charge_area',
+                                               'payment_type',
+                                               'receipt_amount',
+                                               'earned_points',
+                                               'abnormal_case',
+                                               'updated_date',
+                                               'platform',
+                                               'partner',
+                                               'ocr_auto_approved',
+                                               'ocr_id',
+                                               'PartitionKey')\
+                                               .distinct()
+
+
+    spending_output_path = "s3://tpdt-dw/tpdt_dw_spending/"
+    dw_spending_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header", True).save( spending_output_path)
+    print(f"Result Saved in {spending_output_path}...")
+
+
+
+
+# bp_transaction
+try:
+    delta_date = ((datetime.today() + timedelta(hours=8)) - timedelta(days=90)).strftime('%Y-%m-%d')
+
+    t_dw_bp_transaction = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_bp_transaction', transformation_ctx = "dw_bp_transaction")
+    dw_bp_transaction_df = t_dw_bp_transaction.toDF().filter(f"created_date >= '{delta_date}'")
+    print("Source Extraxtion Finished: db03_dw_bp_transaction...")
+
+    pre_action = f"delete from dw.dw_bp_transaction where dw.dw_bp_transaction.created_date >= '{delta_date}';"
+    glueContext.write_dynamic_frame.from_catalog(
+                                                frame=DynamicFrame.fromDF(dw_bp_transaction_df, glueContext, "full_load"),
+                                                database="tpdt_03redshift",
+                                                table_name="tpdt_dw_dw_bp_transaction",
+                                                catalog_connection="tpdt-03redshift-connector",
+                                                redshift_tmp_dir="s3://tpdt-athena-queryresult",
+                                                transformation_ctx="tpdt_dw_dw_bp_transaction",
+                                                additional_options={"preactions": pre_action}
+                                            )
+    print("Inserted to redshift tpdt_dw_dw_bp_transaction...")
+
+except:
+    print("Started except")
+
+    ##mapping table : member
+    t_member_staging = glueContext.create_dynamic_frame.from_catalog(database=db03sub, table_name=prefix03 + 'staging_member', transformation_ctx="staging_member")
+    member_df = t_member_staging.toDF()
+    print("Source Extraxtion Finished: member...")
+
+    ##source extration : tpdt_dw_dw_bp_transaction from redshift
+    t_dw_bp_transaction = glueContext.create_dynamic_frame.from_catalog(
+                                                                        database="tpdt_03redshift",
+                                                                        table_name='tpdt_dw_dw_bp_transaction',
+                                                                        redshift_tmp_dir="s3://tpdt-athena-queryresult",
+                                                                        transformation_ctx="tpdt_dw_dw_bp_transaction"
+                                                                    )
+    print("Source Extraction Finished: db03redshit_tpdt_dw_dw_bp_transaction...")
+
+    dw_bp_transaction_df_raw = t_dw_bp_transaction.toDF().drop('member_status_detail', 'gender', 'age', 'age_group', 'residence', 'district', 'member_tier')
+
+    dw_bp_transaction_df_raw = dw_bp_transaction_df_raw.join(member_df, dw_bp_transaction_df_raw.member_id == member_df.mapping_member_id, how='left')
+
+    dw_bp_transaction_df = dw_bp_transaction_df_raw.select('bonus_points_transaction_id',
+                                                            'created_by',
+                                                            'created_datetime',
+                                                            'created_date',
+                                                            'points',
+                                                            'member_id',
+                                                            'spending_transaction_id',
+                                                            'redemption_transaction_id',
+                                                            'remark',
+                                                            'bp_transaction_type',
+                                                            'bp_transaction_type_detail_1',
+                                                            'bp_transaction_type_detail_2',
+                                                            'expiry_date',
+                                                            'abnormal_case',
+                                                            'created_datetime_before_launch',
+                                                            'age',
+                                                            'age_group',
+                                                            'residence',
+                                                            'district',
+                                                            'member_tier',
+                                                            'member_status_detail',
+                                                            when(col('registration_date') < '2019-03-12', lit(1)).otherwise(lit(0)).alias('is_staff'),
+                                                            'gender',
+                                                            'mall_id',
+                                                            'property_id',
+                                                            'campaign_id',
+                                                            'updated_date',
+                                                            'paritionkey')\
+                                                            .distinct()
+
+
+    bp_transaction_output_path = "s3://tpdt-dw/tpdt_dw_bp_transaction/"
+    dw_bp_transaction_df.write.format('parquet').mode('overwrite').partitionBy("paritionkey").option("header", True).save(bp_transaction_output_path)
+    print(f"Result Saved in {bp_transaction_output_path}...")
+
+
+
+# # spending full load
+# t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database=db03, table_name=prefix03 + 'dw_spending', transformation_ctx="dw_spending")
+# dw_spending_df = t_dw_spending.toDF()
+# print("Source Extraxtion Finished: db03_dw_spending...")
+
+# glueContext.write_dynamic_frame.from_catalog(
+#     frame=DynamicFrame.fromDF(dw_spending_df, glueContext, "full_load"),
+#     database="tpdt_03redshift",
+#     table_name="tpdt_dw_dw_spending",
+#     catalog_connection="tpdt-03redshift-connector",
+#     redshift_tmp_dir="s3://tpdt-athena-queryresult",
+#     transformation_ctx="tpdt_dw_dw_spending"
+# )
+
+# # bp transactions full load
+# t_dw_bp_transaction = glueContext.create_dynamic_frame.from_catalog(database=db03, table_name=prefix03 + 'dw_bp_transaction', transformation_ctx="dw_bp_transaction")
+# dw_bp_transaction_df = t_dw_bp_transaction.toDF()
+# print("Source Extraxtion Finished: db03_dw_bp_transaction...")
+
+# glueContext.write_dynamic_frame.from_catalog(
+#     frame=DynamicFrame.fromDF(dw_bp_transaction_df, glueContext, "full_load"),
+#     database="tpdt_03redshift",
+#     table_name="tpdt_dw_dw_bp_transaction",
+#     catalog_connection="tpdt-03redshift-connector",
+#     redshift_tmp_dir="s3://tpdt-athena-queryresult",
+#     transformation_ctx="tpdt_dw_dw_bp_transaction"
+# )
+# print("Inserted to redshift tpdt_dw_dw_bp_transaction...")
+
+

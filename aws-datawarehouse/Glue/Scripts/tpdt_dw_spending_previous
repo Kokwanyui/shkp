@@ -1,0 +1,386 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row, Window
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import datetime, date, time, timezone,timedelta
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    db03sub="tpdt_03sub"
+    db03staging="tpdt_03staging"
+    db03fd="tpdt_03foodordering"
+    output_path="s3://tpdt-dw/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    foodorder_path="s3://tpdt-foodordering/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    db03fd="tpdt_03foodordering"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    foodorder_path="s3://tpdt-foodordering-"+env+"/"
+
+
+dimension_prefix = "bi_dimension_"
+prefix="shkpmalls_vip_"
+prefix03="tpdt_"
+
+
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : receipt
+t_receipt = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'receipt', transformation_ctx = "receipt")
+receipt_df = t_receipt.toDF().filter("to_date(updated_date) > '2021-12-31'")
+receipt_df.createOrReplaceTempView("receipt")
+print("Source Extraction Finished: receipt...")
+
+##source table : spending_transaction
+t_spending_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'spending_transaction', transformation_ctx = "spending_transaction")
+spending_transaction_df = t_spending_transaction.toDF().filter("to_date(updated_date) > '2021-12-31'")
+spending_transaction_df.createOrReplaceTempView("spending_transaction")
+print("Source Extraxtion Finished: spending_transaction...")
+
+##source table : partner
+t_partner = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'partner', transformation_ctx = "partner")
+partner_df = t_partner.toDF()
+partner_df.createOrReplaceTempView("partner")
+print("Source Extraxtion Finished: partner...")
+
+##source table : partner_spending_transaction
+t_partner_spending_transaction = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'partner_spending_transaction', transformation_ctx = "partner_spending_transaction")
+partner_spending_transaction_df = t_partner_spending_transaction.toDF()
+partner_spending_transaction_df.createOrReplaceTempView("partner_spending_transaction")
+print("Source Extraxtion Finished: partner_spending_transaction...")
+
+## mapping table : food_ordering_header.csv from S3 <- check food ordering
+t_food_order_header= glueContext.create_dynamic_frame.from_catalog(database = db03fd, table_name = prefix03+'dw_food_order_header', transformation_ctx = "dw_food_order_header")
+food_order_header_df = t_food_order_header.toDF()
+food_order_header_df.createOrReplaceTempView("food_order_header")
+print("Source Extraxtion Finished: dim_food_ordering_header.csv...")
+
+## mapping table : dim_tp_mall_mapping.csv
+t_mall_mapping = glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = dimension_prefix+'dim_mall_mapping', transformation_ctx = "dim_mall_mapping")
+mall_mapping_df = t_mall_mapping.toDF()
+mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+
+#mall_mapping_df = spark.read.csv(dimension_path + 'tpdt_dim_tp_mall_mapping/tpdt_dim_tp_mall_mapping.csv', header='true', inferSchema='true', sep=',')
+#mall_mapping_df.createOrReplaceTempView("dim_tp_mall_mapping")
+print("Source Extraxtion Finished: dim_tp_mall_mapping.csv...")
+
+## mapping table : dim_abnormal_log.csv
+if env == 'prod':
+    t_abnormal_log= glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = 'bi_datamart_ods_rmcr_abnormal_case', transformation_ctx = "dim_abnormal_log")
+    abnormal_log_df = t_abnormal_log.toDF().filter('type = "receipt_id"')
+else:
+    abnormal_log_df = spark.read.csv(dimension_path + 'tpdt_dim_abnormal_log/tpdt_dim_abnormal_log.csv', header='true', inferSchema='true', sep=',').filter("type = 'receipt_id'").filter('type = "receipt_id"')
+abnormal_log_df.createOrReplaceTempView("dim_abnormal_log")
+print("Source Extraxtion Finished: dim_abnormal_log.csv...")
+
+## mapping table : duplicated_receipt
+if env == 'prod':
+    t_campaign_duplicated_receipt= glueContext.create_dynamic_frame.from_catalog(database = db02, table_name = 'bi_datamart_ods_campaign_duplicated_receipt', transformation_ctx = "campaign_duplicated_receipt")
+    campaign_duplicated_receipt_df = t_campaign_duplicated_receipt.toDF()
+else:
+    campaign_duplicated_receipt_df = spark.read.csv(dimension_path + 'tpdt_dim_campaign_duplicated_receipt/tpdt_dim_campaign_duplicated_receipt.csv', header='true', inferSchema='true', sep=',')
+campaign_duplicated_receipt_df.createOrReplaceTempView("campaign_duplicated_receipt")
+print("Source Extraxtion Finished: dim_abnormal_log.csv...")
+
+##mapping table : member
+t_member_staging= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_member', transformation_ctx = "staging_member")
+member_df = t_member_staging.toDF()
+print("Source Extraxtion Finished: member...")
+
+##mapping table : shop
+t_shop= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'staging_shop', transformation_ctx = "staging_shop")
+shop_df = t_shop.toDF().drop('team')
+print("Source Extraxtion Finished: shop...")
+
+## mapping table : dim_correct_amount.csv
+correct_amount_df = spark.read.csv(dimension_path + 'tpdt_dim_correct_amount/tpdt_dim_correct_amount.csv', header='true', inferSchema='true', sep=',')\
+                         .select(col('receipt_id').alias('mapping_receipt_id'), 'correct_receipt_amount')
+correct_amount_df.createOrReplaceTempView("dim_correct_amount")
+print("Source Extraxtion Finished: dim_correct_amount.csv...")
+
+# mapping table: tpdt_adhoc
+t_earned_point= glueContext.create_dynamic_frame.from_catalog(database = db03staging, table_name = prefix03+'adhoc', transformation_ctx = "adhoc")
+earned_point = t_earned_point.toDF().select(col('receipt_id').alias('mapping_receipt_id'),
+                                            col(spending_transaction_id).alias('spending_transaction_id2'),
+                                            'earned_points'                                            )
+print("Source Extraxtion Finished: tpdt_adhoc...")
+
+
+
+## spending master before 2022
+t_spending_before_2022= glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'dw_spending_before_2022', transformation_ctx = "tpdt_dw_spending_before_2022")
+spending_before_2022_df = t_spending_before_2022.toDF().drop('member_status_detail','registration_date','gender','age','age_group','residence','district','district_cs','member_tier')
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+print("Perform data transformation...")
+
+## Transformation Step 1: Earned Points
+#earned_point = spark.sql("""
+#			SELECT
+#			 r.receipt_id as mapping_receipt_id,
+#			 r.spending_transaction_id as  spending_transaction_id2,
+#             CASE WHEN  st.earned_points - COALESCE(SUM(r2.amount), 0)  > r.amount  THEN r.amount
+#				  WHEN  st.earned_points - COALESCE(SUM(r2.amount), 0)  > 0 AND st.earned_points - COALESCE(SUM(r2.amount), 0)  <= r.amount  THEN  st.earned_points - COALESCE(SUM(r2.amount), 0)
+#				  ELSE 0 END AS earned_points
+#			FROM  receipt r
+#			LEFT JOIN  spending_transaction st ON  st.spending_transaction_id = r.spending_transaction_id
+#            LEFT JOIN  receipt              r2 ON  r2.spending_transaction_id = r.spending_transaction_id  AND  r2.receipt_id < r.receipt_id
+#			GROUP BY r.receipt_id ,r.spending_transaction_id  ,st.earned_points  ,r.amount
+#""")
+#print("Tranformation: Earned Point Adjusted")
+
+
+## Transformation Step 2: Extract Successful Partner Spending Transaction and Map Partner
+tmp_partner_mapping = spark.sql("""
+		SELECT
+		 t1.result as mapping_spending_transaction_id,
+		 t2.name_lang1 as partner
+		from partner_spending_transaction as t1
+		inner join partner as t2 on t1.partner_id = t2.partner_id
+		where success = 1
+""")
+print("Tranformation: Partner Transaction Mapped")
+
+
+## Transformation Step3: Extract Inactive Food Ordering
+tmp_inactive_food_ordering = spark.sql("""
+		select  distinct invoice_no as mapping_invoice_no
+		from food_order_header
+		where payment_status=0 or order_status not in (2,12,99) or member_status_detail is null
+""")
+print("Tranformation: Inactive Food Ordering Extracted")
+
+## Transformation Step 5: Select columns and cleaning for receipts and spending transaction
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+receipt_status_detail = {
+    'A': 'Approved',
+    'R': 'Rejected',
+    'W': 'Waiting for Approval',
+    'V': 'Invalid'
+    }
+
+receipt_type_detail = {
+    'B': 'Spending to Earn Point',
+    'G': 'Spending to Redeem Gift',
+    'S': 'Spending to Redeem Gift'
+    }
+
+def approve_or_reject(receipt_status, receipt_updated_by):
+    if (receipt_status =='A') or (receipt_status =='R'):
+        result = receipt_updated_by
+    else:
+        result = None
+    return result
+
+approve_or_reject_udf = udf(approve_or_reject, StringType())
+
+
+receipt_staging_df = receipt_df.select('receipt_id',
+                                       'invoice_no',
+                                       'created_by',
+                                       'updated_by',
+                                       'spending_transaction_id',
+                                       col('created_date').alias('receipt_upload_datetime'),
+                                       to_date(col('created_date') - expr("INTERVAL 8 HOURS")).alias('receipt_upload_date').cast(DateType()),
+                                       to_date(col('receipt_date')).alias('receipt_transaction_date').cast(DateType()),
+                                       col('receipt_datetime').alias('receipt_transaction_datetime'),
+                                       'status',
+                                       'mall_id',
+                                       'shop_id',
+                                       col('payment_type_lang1').alias('payment_type'),
+                                       col('original_amount').alias('receipt_amount'),
+                                       'updated_date',
+                                       'ocr_id')\
+                                       .withColumn('approve_or_reject_by', approve_or_reject_udf('status', 'updated_by'))\
+                                       .where("year(receipt_date) >= 2019")
+
+
+
+spending_transaction_df = spending_transaction_df.select(col('spending_transaction_id').alias('mapping_spending_transaction_id'),
+                                                         to_date(col('approval_date') - expr("INTERVAL 8 HOURS")).alias('approve_or_reject_date').cast(DateType()),
+                                                         col('approval_date').alias('approve_or_reject_datetime'),
+                                                         col('reject_reason_lang1').alias('reject_reason'),
+                                                         'type',
+                                                         'member_id',
+                                                         'platform',
+                                                         col('auto_approved').alias('ocr_auto_approved'))
+
+receipt_status_detail_df = spark.createDataFrame(receipt_status_detail.items(),schema=StructType(fields=[
+                                                                                                StructField("mapping_status", StringType()),
+                                                                                                StructField("receipt_status_detail", StringType())]))
+
+receipt_type_detail_df = spark.createDataFrame(receipt_type_detail.items(),schema=StructType(fields=[
+                                                                                                StructField("mapping_type", StringType()),
+                                                                                                StructField("receipt_type_detail", StringType())]))
+
+
+# Transformation 7: Join all df together
+spending_staging_df = receipt_staging_df.join(spending_transaction_df, receipt_staging_df.spending_transaction_id == spending_transaction_df.mapping_spending_transaction_id, how='left')\
+                                        .join(tmp_inactive_food_ordering, receipt_staging_df.invoice_no == tmp_inactive_food_ordering.mapping_invoice_no, how='left')\
+                                        .filter("member_id != 'SHKP0519009'")
+
+
+spending_staging_df.persist()
+
+mall_mapping_df = mall_mapping_df.withColumnRenamed('mall_id','mapping_mall_id')\
+                                 .withColumnRenamed('district','mall_district')\
+                                 .withColumnRenamed('district_cs','mall_district_cs')
+shop_df = shop_df.withColumnRenamed('shop_id','mapping_shop_id')\
+                 .withColumnRenamed('mall_id','mapping_mall_id')\
+                 .withColumnRenamed('property_id','mapping_property_id')
+
+spending_staging_df = spending_staging_df.join(receipt_status_detail_df, spending_staging_df.status == receipt_status_detail_df.mapping_status, how = 'left')\
+                                         .join(receipt_type_detail_df, spending_staging_df.type == receipt_type_detail_df.mapping_type, how = 'left')\
+                                         .join(earned_point, spending_staging_df.receipt_id == earned_point.mapping_receipt_id, how = 'left')\
+                                         .join(tmp_partner_mapping, spending_staging_df.spending_transaction_id == tmp_partner_mapping.mapping_spending_transaction_id, how = 'left')\
+                                         .join(mall_mapping_df, spending_staging_df.mall_id == mall_mapping_df.mapping_mall_id, how = 'left')\
+                                         .join(shop_df, spending_staging_df.shop_id == shop_df.mapping_shop_id, how = 'left')\
+                                         .join(abnormal_log_df, abnormal_log_df.value == spending_staging_df.receipt_id, how = 'left')\
+                                         .join(correct_amount_df, correct_amount_df.mapping_receipt_id == spending_staging_df.receipt_id, how ='left' )\
+                                         .join(campaign_duplicated_receipt_df, campaign_duplicated_receipt_df.receipt_id_dup == spending_staging_df.receipt_id, how ='left' )
+
+# Transformation 8: tpdt_dw_spending final schema
+dw_spending_2022_or_after = spending_staging_df.select('receipt_id',
+                                              'invoice_no',
+                                              'receipt_status_detail',
+                                              'created_by',
+                                              'receipt_upload_datetime',
+                                              'receipt_upload_date',
+                                              'receipt_transaction_datetime',
+                                              'receipt_transaction_date',
+                                              'spending_transaction_id',
+                                              'approve_or_reject_by',
+                                              'approve_or_reject_datetime',
+                                              'approve_or_reject_date',
+                                              'reject_reason',
+                                              'receipt_type_detail',
+                                              'mall_id',
+                                              'property_id',
+                                              'team',
+                                              'member_id',
+                                              'shop_id',
+                                              'shop_name',
+                                              'lms_agreement_no',
+                                              'lms_trade_name',
+                                              'lms_standard_brand_name',
+                                              'lms_standard_trade_category',
+                                              'lms_standard_group',
+                                              col('lms_charge_area').cast(StringType()).alias('lms_charge_area'),
+                                              'payment_type',
+                                              when(col('correct_receipt_amount').isNotNull(), col('correct_receipt_amount')).otherwise(col('receipt_amount')).alias('receipt_amount'),
+                                              'earned_points',
+                                              when(col('value').isNotNull(), lit(1))\
+                                              .when(col('receipt_id_dup').isNotNull(), lit(1))\
+                                              .otherwise(lit(0)).alias('abnormal_case'),
+                                              'updated_date',
+                                              'platform',
+                                              'partner',
+                                              'ocr_auto_approved',
+                                              'ocr_id',
+                                              col('receipt_transaction_date').alias('PartitionKey'))\
+                                              .distinct()
+
+tpdt_dw_spending_raw = dw_spending_2022_or_after.union(spending_before_2022_df).distinct()
+
+tpdt_dw_spending_raw2 = tpdt_dw_spending_raw.join(member_df, tpdt_dw_spending_raw.member_id == member_df.mapping_member_id, how = 'left')
+
+dw_spending_final = tpdt_dw_spending_raw2.select('receipt_id',
+                                              'invoice_no',
+                                              'receipt_status_detail',
+                                              'created_by',
+                                              'receipt_upload_datetime',
+                                              'receipt_upload_date',
+                                              'receipt_transaction_datetime',
+                                              'receipt_transaction_date',
+                                              'spending_transaction_id',
+                                              'approve_or_reject_by',
+                                              'approve_or_reject_datetime',
+                                              'approve_or_reject_date',
+                                              'reject_reason',
+                                              'receipt_type_detail',
+                                              'mall_id',
+                                              'property_id',
+                                              'team',
+                                              'member_id',
+                                              'member_status_detail',
+                                              'registration_date',
+                                              'gender',
+                                              'age',
+                                              'age_group',
+                                              'residence',
+                                              'district',
+                                              'district_cs',
+                                              'member_tier',
+                                              'shop_id',
+                                              'shop_name',
+                                              'lms_agreement_no',
+                                              'lms_trade_name',
+                                              'lms_standard_brand_name',
+                                              'lms_standard_trade_category',
+                                              'lms_standard_group',
+                                              'lms_charge_area',
+                                              'payment_type',
+                                              'receipt_amount',
+                                              'earned_points',
+                                              'abnormal_case',
+                                              'updated_date',
+                                              'platform',
+                                              'partner',
+                                              'ocr_auto_approved',
+                                              'ocr_id',
+                                              'PartitionKey')\
+                                              .distinct()
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+dw_spending_final.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header",True).save(output_path)
+print(f"Result Saved in {output_path}...")
+job.commit()
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+

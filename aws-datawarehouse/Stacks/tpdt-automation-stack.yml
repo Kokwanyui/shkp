@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Stack to deploy automation task resources
+
+
+Parameters:
+  AWSTeam:
+    Type: String
+    Default: tpdt
+  AWSEnv:
+    Type: String
+    MinLength: '3'
+    MaxLength: '6'
+    AllowedPattern: ^dev|prod|uat$
+    ConstraintDescription: must be dev, prod, uat
+  S3ArtifactBucket:
+    Type: String
+  lambdaIamRole:
+    Type: String
+  accountid:
+    Type: String
+
+
+Conditions:
+  IsNotPrd: !Not
+    - !Equals
+      - !Ref AWSEnv
+      - 'prod'
+
+Resources:
+  # Creating Automation Reporting Resources - Start
+  reportdetail:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Get Reporting Config from db02
+      FunctionName: !Sub '${AWSTeam}-auto-report-task-detail'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/auto_report_task_detail.zip
+      Timeout: 300
+      Environment:
+        Variables:
+          environment: !Ref AWSEnv
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-09008dc3534447e51
+        SubnetIds:
+          - subnet-0406aa5bbf9d46605
+          - subnet-0768b1e8f3bd1a45b
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: automation
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pandas:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_SQLAlchemy:1'
+        - !Sub 'arn:aws:lambda:ap-east-1:${accountid}:layer:tpdt_pymysql:1'
+
+  athenaExtraction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Run Athena Query
+      FunctionName: !Sub '${AWSTeam}-auto-report-athena-extraction'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/auto_report_athena_extraction.zip
+      Timeout: 300
+      Environment:
+        Variables:
+          environment: !Ref AWSEnv
+      ReservedConcurrentExecutions: 10
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: automation
+      TracingConfig:
+        Mode: Active
+
+  snsPublish:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Run Athena Query
+      FunctionName: !Sub '${AWSTeam}-auto-report-sns-publish'
+      Runtime: python3.9
+      Role: !Ref lambdaIamRole
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref S3ArtifactBucket
+        S3Key: Lambda/Functions/auto_report_sns_publish.zip
+      Timeout: 300
+      Environment:
+        Variables:
+          environment: !Ref AWSEnv
+      ReservedConcurrentExecutions: 10
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: stack
+          Value: automation
+      TracingConfig:
+        Mode: Active
+
+  AutoReport:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWSTeam}-auto-report'
+      DefinitionS3Location:
+        Bucket:  !Ref S3ArtifactBucket
+        Key: 'StepFunctions/StateMachine/auto_reports.json'
+      DefinitionSubstitutions:
+        reportdetail: !GetAtt reportdetail.Arn
+        athenaExtraction: !GetAtt athenaExtraction.Arn
+        snsPublish: !GetAtt snsPublish.Arn
+      RoleArn: !Ref lambdaIamRole
+      Tags:
+        - Key: application
+          Value: !Ref AWSTeam
+        - Key: environment
+          Value: !Ref AWSEnv
+        - Key: deployfrom
+          Value: automation
+        - Key: stack
+          Value: autoreport
+  # Creating Automation Reporting Resources - End

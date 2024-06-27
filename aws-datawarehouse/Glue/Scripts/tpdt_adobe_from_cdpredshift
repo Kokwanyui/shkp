@@ -1,0 +1,161 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.functions import *
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType, FloatType
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql.window import Window
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+ 
+
+##Input and Output Config
+env = args['env']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db02="tpdt_02replica"
+    db03="tpdt_03dw"
+    db03sub="tpdt_03sub"
+    output_path="s3://tpdt-adobe-dw/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    secret_name = "tpdt_cdp_redshift"
+    tmpdir = "s3://tpdt-data-from-cdp/redshift_tmpdir/"
+    artifacts_s3 = "tpdt-artifacts"
+
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    output_path="s3://tpdt-adobe-dw-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    secret_name = f'tpdt_cdp_redshift_{env}'
+    tmpdir = f"s3://tpdt-data-from-cdp-{env}/redshift_tmpdir/"
+    artifacts_s3 = "tpdt-artifacts-{env}"
+
+
+dimension_prefix = 'bi_dimension_'
+
+client = boto3.client('secretsmanager')
+response = client.get_secret_value(SecretId=secret_name)
+secret = json.loads(response['SecretString'])
+    
+username = secret["username"]
+pw = secret["password"]
+host = secret["host"]
+port = secret["port"]
+db = secret["dbname"]
+
+# ETL job using UTC time
+yesterday = datetime.now() 
+yesterday_string = datetime.strftime(yesterday, '%Y-%m-%d')
+
+# UDFs
+def inital_load(schema, table):
+    # Redshift Connection Config
+    my_conn_options = {  
+        "url": f"jdbc:redshift://{host}:{port}/{db}",
+        "dbtable": f'{schema}.{table}',
+        "user": username,
+        "password": pw,
+        "customJdbcDriverS3Path": f"s3://{artifacts_s3}/Glue/PythonLibraries/redshift-jdbc42-2.1.0.1.jar",
+        "customJdbcDriverClassName": "com.amazon.redshift.Driver",
+        "sslMode": "DISABLED",
+        "redshiftTmpDir": tmpdir
+    }
+    
+    # Read Data from CDP Redshift
+    source_dydf = glueContext.create_dynamic_frame.from_options(connection_type = "redshift", connection_options = my_conn_options)
+    source_df = source_dydf.toDF()
+    return source_df
+
+def delta_load(query):
+    # Read Data from CDP Redshift
+    source_dydf = glueContext.read.format("jdbc")\
+    .option("url",f"jdbc:redshift://{host}:{port}/{db}")\
+    .option("user",username)\
+    .option("password",pw)\
+    .option("dbtable",query)\
+    .load()
+    return source_dydf
+    
+# tables to extract
+# Extract Delivery_date---------------------------------------------------------------------------------------------------
+# Table: delivery_data ---------------------------------------------------------------------------------------------------
+table = 'delivery_data'
+cdp_schema = 'shkp_adobe_stg_ext'
+output_location=output_path+table+'/'
+
+df = inital_load(cdp_schema, table)
+df2 = df.withColumn('date_modified', to_timestamp(col('date_modified'),'MM-dd-yyyy HH:mm:ss'))\
+        .withColumn('contact_date', to_timestamp(col('contact_date'),'MM-dd-yyyy HH:mm:ss'))
+df2.write.format('parquet').mode('overwrite').option("header",True).save(output_location) 
+
+# Table: delivery_log ---------------------------------------------------------------------------------------------------
+log_table = 'delivery_log'
+log_schema = 'shkp_adobe_stg_ext'
+log_output_location=f'{output_path}edm_{log_table}/'
+log_query = f"(Select * from {log_schema}.{log_table} where date(last_modified_date) = '{yesterday_string}') as t1"
+
+t_raw = delta_load(log_query)
+raw_df = t_raw.withColumn('event_date', to_timestamp(col('event_date'),'yyyy-MM-dd HH:mm:ss'))\
+              .withColumn('is_test_profile', col('is_test_profile').cast(IntegerType()))\
+              .withColumn('last_modified_date', to_timestamp(col('last_modified_date'),'yyyy-MM-dd HH:mm:ss'))\
+              .withColumn('event_date_year', col('event_date_year').cast(IntegerType()))\
+              .withColumn('event_date_month', col('event_date_month').cast(IntegerType()))\
+              .withColumn('event_date_day', col('event_date_day').cast(IntegerType()))\
+              .withColumn('partition_key', concat_ws('-',col('event_date_year'), col('event_date_month'), col('event_date_day')))
+
+raw_df.write.format('parquet').mode('append').partitionBy('partition_key').option("header",True).save(log_output_location)
+
+# Table: tracking_log ---------------------------------------------------------------------------------------------------
+tracking_table = 'tracking_log'
+tracking_schema = 'shkp_adobe_stg_ext'
+tracking_output_location=f'{output_path}edm_{tracking_table}/'
+tracking_query = f"(Select * from {tracking_schema}.{tracking_table} where date(log_date) = '{yesterday_string}') as t1"
+
+t_tracking = delta_load(tracking_query)
+tracking_df = t_tracking.withColumn('log_date', to_timestamp(col('log_date'),'yyyy-MM-dd HH:mm:ss'))\
+                   .withColumn('log_date_year', col('log_date_year').cast(IntegerType()))\
+                   .withColumn('log_date_month', col('log_date_month').cast(IntegerType()))\
+                   .withColumn('log_date_day', col('log_date_day').cast(IntegerType()))\
+                   .withColumn('partition_key', concat_ws('-',col('log_date_year'), col('log_date_month'), col('log_date_day')))
+
+tracking_df.write.format('parquet').mode('append').partitionBy('partition_key').option("header",True).save(tracking_output_location)
+
+
+# Table: location_profile ---------------------------------------------------------------------------------------------------
+location_table = 'location_profile'
+location_schema = 'shkp_adobe_stg_ext'
+location_output_location=f'{output_path}{location_table}/'
+location_query = f"(Select * from {location_schema}.{location_table} where date(visited_time) = '{yesterday_string}') as t1"
+
+t_location = delta_load(location_query)
+location_df = t_location.withColumn('visited_time', to_timestamp(col('visited_time'),'yyyy-MM-dd HH:mm:ss'))\
+                        .withColumn('point_of_interest_radius', col('point_of_interest_radius').cast(IntegerType()))\
+                        .withColumn('latitude', col('latitude').cast(FloatType()))\
+                        .withColumn('longitude', col('longitude').cast(FloatType()))\
+                        .withColumn('visited_time_year', col('visited_time_year').cast(IntegerType()))\
+                        .withColumn('visited_time_month', col('visited_time_month').cast(IntegerType()))\
+                        .withColumn('visited_time_day', col('visited_time_day').cast(IntegerType()))\
+                        .withColumn('partition_key', concat_ws('-',col('visited_time_year'), col('visited_time_month'), col('visited_time_day')))
+
+location_df.write.format('parquet').mode('append').partitionBy('partition_key').option("header",True).save(location_output_location)
+

@@ -1,0 +1,141 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql import Row, Window
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+from datetime import datetime, date, time, timezone,timedelta
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+spark.conf.get("spark.sql.autoBroadcastJoinThreshold")
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    db03sub="tpdt_03sub"
+    db03fd="tpdt_03foodordering"
+    output_path="s3://tpdt-adhoc/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+    foodorder_path="s3://tpdt-foodordering/"
+    db03adhoc = "tpdt_03adhoc"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    db03sub="tpdt_03sub_"+env
+    db03fd="tpdt_03foodordering"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+    foodorder_path="s3://tpdt-foodordering-"+env+"/"
+
+
+dimension_prefix = "bi_dimension_"
+prefix="shkpmalls_vip_"
+prefix03="tpdt_"
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : dw_spending
+try:
+    t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending', transformation_ctx = "dw_spending")
+    dw_spending_df = t_dw_spending.toDF()
+    dw_spending_df.createOrReplaceTempView("dw_spending")
+    print("Source Extraxtion Finished: db03_dw_spending...")
+    spending_output_path = "s3://tpdt-staging/tpdt_dw_spending_back_up/"
+    dw_spending_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header", True).save(spending_output_path)
+    print(f"Result Saved in {spending_output_path}...")
+
+except:
+    t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'dw_spending_back_up', transformation_ctx = "dw_spending_back_up")
+    dw_spending_df = t_dw_spending.toDF()
+    dw_spending_df.createOrReplaceTempView("dw_spending_back_up")
+    print("Source Extraxtion Finished: db03sub_dw_spending_back_up...")
+    spending_output_path = "s3://tpdt-dw/tpdt_dw_spending/"
+    dw_spending_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header", True).save(spending_output_path)
+    print(f"Result Saved in {spending_output_path}...")
+
+
+##source table : bp_transaction
+try:
+    t_dw_bp_transaction = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_bp_transaction', transformation_ctx = "dw_bp_transaction")
+    dw_bp_transaction_df = t_dw_bp_transaction.toDF()
+    dw_bp_transaction_df.createOrReplaceTempView("dw_bp_transaction")
+    print("Source Extraxtion Finished: db03_dw_bp_transaction...")
+    bp_transaction_output_path = "s3://tpdt-staging/tpdt_dw_bp_transaction_back_up/"
+    dw_bp_transaction_df.write.format('parquet').mode('overwrite').partitionBy('paritionkey').option("header", True).save(bp_transaction_output_path)
+    print(f"Result Saved in {bp_transaction_output_path}...")
+
+except:
+    t_dw_bp_transaction = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'dw_bp_transaction_back_up', transformation_ctx = "dw_bp_transaction_back_up")
+    dw_bp_transaction_df = t_dw_bp_transaction.toDF()
+    dw_bp_transaction_df.createOrReplaceTempView("dw_bp_transaction_back_up")
+    print("Source Extraxtion Finished: db03sub_dw_bp_transaction_back_up...")
+    bp_transaction_output_path = "s3://tpdt-dw/tpdt_dw_bp_transaction/"
+    dw_bp_transaction_df.write.format('parquet').mode('overwrite').partitionBy('paritionkey').option("header", True).save(bp_transaction_output_path)
+    print(f"Result Saved in {bp_transaction_output_path}...")
+
+
+
+#
+#
+# ##source table : dw_spending
+# try:
+#     t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_spending_testing', transformation_ctx = "dw_spending_testing")
+#     dw_spending_df = t_dw_spending.toDF()
+#     dw_spending_df.createOrReplaceTempView("dw_spending_testing")
+#     print("Source Extraxtion Finished: db03_dw_spending_testing...")
+#     spending_output_path = "s3://tpdt-staging/tpdt_dw_spending_testing/"
+#     dw_spending_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header", True).save(spending_output_path)
+#     print(f"Result Saved in {spending_output_path}...")
+#
+# except:
+#     t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'dw_spending_testing', transformation_ctx = "dw_spending_testing")
+#     dw_spending_df = t_dw_spending.toDF()
+#     dw_spending_df.createOrReplaceTempView("dw_spending_testing")
+#     print("Source Extraxtion Finished: db03sub_dw_spending_testing...")
+#     spending_output_path = "s3://tpdt-dw/tpdt_dw_spending_testing/"
+#     dw_spending_df.write.format('parquet').mode('overwrite').partitionBy("PartitionKey").option("header", True).save(spending_output_path)
+#     print(f"Result Saved in {spending_output_path}...")
+#
+#
+# ##source table : bp_transaction
+# try:
+#     t_dw_bp_transaction = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix03+'dw_bp_transaction_testing', transformation_ctx = "dw_bp_transaction_testing")
+#     dw_bp_transaction_df = t_dw_bp_transaction.toDF()
+#     dw_bp_transaction_df.createOrReplaceTempView("dw_bp_transaction_testing")
+#     print("Source Extraxtion Finished: db03_dw_bp_transaction_testing...")
+#     bp_transaction_output_path = "s3://tpdt-staging/tpdt_dw_bp_transaction_testing/"
+#     dw_bp_transaction_df.write.format('parquet').mode('overwrite').partitionBy('paritionkey').option("header", True).save(bp_transaction_output_path)
+#     print(f"Result Saved in {bp_transaction_output_path}...")
+#
+# except:
+#     t_dw_bp_transaction = glueContext.create_dynamic_frame.from_catalog(database = db03sub, table_name = prefix03+'dw_bp_transaction_testing', transformation_ctx = "dw_bp_transaction_testing")
+#     dw_bp_transaction_df = t_dw_bp_transaction.toDF()
+#     dw_bp_transaction_df.createOrReplaceTempView("dw_bp_transaction_testing")
+#     print("Source Extraxtion Finished: db03sub_dw_bp_transaction_testing...")
+#     bp_transaction_output_path = "s3://tpdt-dw/tpdt_dw_bp_transaction_testing/"
+#     dw_bp_transaction_df.write.format('parquet').mode('overwrite').partitionBy('paritionkey').option("header", True).save(bp_transaction_output_path)
+#     print(f"Result Saved in {bp_transaction_output_path}...")

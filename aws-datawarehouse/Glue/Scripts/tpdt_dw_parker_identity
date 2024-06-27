@@ -1,0 +1,313 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8")
+spark.conf.set("spark.sql.broadcastTimeout", 7200)
+
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db_parking="tpdt_03parking"
+    db_ev_charging="tpdt_03parking"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-parking/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    ## db_parking="tpdt_03parking"+env
+    db_parking ="tpdt_03dw_"+env
+    db_ev_charging = "tpdt_ev_test_" + env
+    output_path="s3://tpdt-dw-"+env+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="carpark_data_"
+if env =='dev':
+    carpark_bi_prefix="shkpmalls_carpark_bi_"
+else:
+    carpark_bi_prefix="shkpmalls_carpark_"
+prefix02="tpdt_"
+
+
+if env =='prod':
+    ev_charging_table_name="tpdt_ev_rsr_raw_final"
+else:
+    ev_charging_table_name="rsr_status"
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : member
+t_member = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = 'shkpmalls_vip_member', transformation_ctx = "member")
+member_df = t_member.toDF().select(col('member_id').alias('memberId'), col('status').alias('member_status'))
+member_df.createOrReplaceTempView("member")
+print("Source Extraction Finished: Member...")
+
+
+##source table : dw_spending
+t_dw_spending = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix02+'dw_spending', transformation_ctx = "dw_spending")
+dw_spending_df = t_dw_spending.toDF().select('member_id',
+                                             'property_id',
+                                             'receipt_id',
+                                             'receipt_transaction_date',
+                                             'invoice_no',
+                                             'shop_id',
+                                             'shop_name',
+                                             'receipt_amount',
+                                             concat(to_date(col('receipt_transaction_date')),lit('|'),col('property_id'),lit('|'),lower(regexp_replace(col('invoice_no'), '^[0]*', '')),lit('|'),col('receipt_amount')).alias('mapping_key'))
+dw_spending_df.createOrReplaceTempView("dw_spending")
+print("Source Extraxtion Finished: dw_spending...")
+
+
+##source table : dw_parking_invoice
+t_dw_parking_invoice = glueContext.create_dynamic_frame.from_catalog(database = db_parking, table_name = prefix02+'dw_parking_invoice', transformation_ctx = "dw_parking_invoice")
+dw_parking_invoice_df = t_dw_parking_invoice.toDF().select('card_no',
+                                             upper(trim(col('car_plate'))).alias('car_plate_parking'),
+                                             col('property_id').alias('property_id_parking'),
+                                             trim(col('card_no')).alias('card_no_parking'),
+                                             col('redemption_datetime').alias('freeparking_redemption_date_parking'),
+                                             col('invoice_no').alias('invoice_no_parking'),
+                                             col('shop_name').alias('shop_name_parking'),
+                                             col('invoice_amount').alias('receipt_amount_parking'),
+                                             col('member_id').alias('member_id_parking'),
+                                             concat(to_date(col('car_in_datetime')- expr("INTERVAL 8 HOURS")),lit('|'),col('property_id'),lit('|'),lower(col('invoice_no')),lit('|'),col('invoice_amount')).alias('mapping_key'))
+dw_parking_invoice_df.createOrReplaceTempView("dw_parking_invoice")
+print("Source Extraxtion Finished: dw_parking_invoice...")
+
+##source table : redemption_tid_log
+t_redemption_tid_log = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = carpark_bi_prefix+'redemption_tid_log', transformation_ctx = "redemption_tid_log")
+redemption_tid_log_df = t_redemption_tid_log.toDF()
+print("Source Extraxtion Finished: redemption_tid_log...")
+
+##source table : vehicles
+t_vehicles = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = carpark_bi_prefix+'vehicles', transformation_ctx = "vehicles")
+vehicles_df = t_vehicles.toDF().select(lit('identify by Contactless Parking').alias('identify_type'),
+                                    col('memberId').alias('member_id'),
+                                    trim(col('cardNo')).alias('card_no'),
+                                    upper(trim(col('lpn'))).alias('car_plate'),
+                                    lit(None).alias('property_id'),
+                                    lit(None).alias('receipt_id'),
+                                    lit(None).alias('receipt_transaction_date'),
+                                    lit(None).alias('invoice_no'),
+                                    lit(None).alias('shop_id'),
+                                    lit(None).alias('shop_name'),
+                                    lit(None).alias('receipt_amount'),
+                                    lit(None).alias('property_id_parking'),
+                                    lit(None).alias('card_no_parking'),
+                                    lit(None).alias('car_plate_parking'),
+                                    lit(None).alias('freeparking_redemption_date_parking'),
+                                    lit(None).alias('invoice_no_parking'),
+                                    lit(None).alias('shop_name_parking'),
+                                    lit(None).alias('receipt_amount_parking'),
+                                    lit(None).alias('redemption_transaction_id'),
+                                    lit(None).alias('ev_charging_date'))\
+                                    .filter("validationsts = 1")\
+                                    .filter("member_id != ''")
+vehicles_df.createOrReplaceTempView("vehicles")
+print("Source Extraxtion Finished: vehicles...")
+
+
+
+##source table : ev_rsr_raw
+t_ev_rsr_raw = glueContext.create_dynamic_frame.from_catalog(database = db_ev_charging, table_name = ev_charging_table_name, transformation_ctx = "ev_charging")
+identify_by_ev_charging_df = t_ev_rsr_raw.toDF().select(lit('identify by EV Charging').alias('identify_type'),
+                                    col('externalmemberid').alias('member_id'),
+                                    lit(None).alias('card_no'),
+                                    upper(trim(col('lp'))).alias('car_plate'),
+                                    lit(None).alias('property_id'),
+                                    lit(None).alias('receipt_id'),
+                                    lit(None).alias('receipt_transaction_date'),
+                                    lit(None).alias('invoice_no'),
+                                    lit(None).alias('shop_id'),
+                                    lit(None).alias('shop_name'),
+                                    lit(None).alias('receipt_amount'),
+                                    lit(None).alias('property_id_parking'),
+                                    lit(None).alias('card_no_parking'),
+                                    lit(None).alias('car_plate_parking'),
+                                    lit(None).alias('freeparking_redemption_date_parking'),
+                                    lit(None).alias('invoice_no_parking'),
+                                    lit(None).alias('shop_name_parking'),
+                                    lit(None).alias('receipt_amount_parking'),
+                                    lit(None).alias('redemption_transaction_id'),
+                                    to_timestamp(col('createdttm'))+expr("INTERVAL 8 HOURS").alias('ev_charging_date'))\
+                                    .filter(col('status').isin(["Settled", "Unsettled"]))\
+                                    .filter("member_id IS NOT NULL")
+print("Source Extraxtion Finished: ev_charging...")
+
+
+identify_by_member_parking_df = dw_parking_invoice_df.select(lit('identify by member parking').alias('identify_type'),
+                                    upper(trim(col('member_id_parking'))).alias('member_id'),
+                                    lit(None).alias('card_no'),
+                                    col('car_plate_parking').alias('car_plate'),
+                                    lit(None).alias('property_id'),
+                                    lit(None).alias('receipt_id'),
+                                    lit(None).alias('receipt_transaction_date'),
+                                    lit(None).alias('invoice_no'),
+                                    lit(None).alias('shop_id'),
+                                    lit(None).alias('shop_name'),
+                                    lit(None).alias('receipt_amount'),
+                                    'property_id_parking',
+                                    'card_no_parking',
+                                    'car_plate_parking',
+                                    'freeparking_redemption_date_parking',
+                                    'invoice_no_parking',
+                                    'shop_name_parking',
+                                    'receipt_amount_parking',
+                                    lit(None).alias('redemption_transaction_id'),
+                                    lit(None).alias('ev_charging_date'))\
+                                    .filter(col('member_id').startswith("SHKP"))
+
+
+##source table : redemption_activity_log
+t_redemption_activity_log = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = carpark_bi_prefix+'redemption_activity_log', transformation_ctx = "redemption_activity_log")
+redemption_activity_log_df = t_redemption_activity_log.toDF().select('log_id', trim(col('card_num')).alias('card_num'), trim(col('lpn')).alias('car_plate'), 'r_time')
+print("Source Extraxtion Finished: redemption_activity_log_df...")
+
+##source table : dw_redemption
+t_dw_redemption = glueContext.create_dynamic_frame.from_catalog(database = db03, table_name = prefix02+'dw_redemption', transformation_ctx = "dw_redemption")
+dw_redemption_df = t_dw_redemption.toDF().select('member_id', 'transaction_id')
+print("Source Extraxtion Finished: dw_redemption...")
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+## Data Transformation ------------------------------------------------------------------------------------------------------------------------------
+identify_by_Invoice_df = spark.sql("""
+    Select distinct
+				'identify by Invoice' as identify_type,
+				spend.member_id,
+				invoice.card_no as card_no,
+				upper(trim(invoice.car_plate_parking)) as car_plate,
+				spend.property_id,
+				spend.receipt_id,
+				spend.receipt_transaction_date,
+				spend.invoice_no,
+				spend.shop_id,
+				spend.shop_name,
+				spend.receipt_amount,
+				invoice.property_id_parking,
+				invoice.card_no_parking,
+				invoice.car_plate_parking,
+				invoice.freeparking_redemption_date_parking,
+				invoice.invoice_no_parking,
+				invoice.shop_name_parking,
+				invoice.receipt_amount_parking,
+				NULL as redemption_transaction_id,
+				NULL as ev_charging_date
+	from		dw_spending as spend
+	inner join  dw_parking_invoice as invoice   on		spend.mapping_key = invoice.mapping_key
+	where spend.member_id <> '' and substring(member_id_parking,1,4) != 'SHKP'
+""")
+
+identify_by_Inapp_Free_Parking_Redemption = redemption_tid_log_df.join(redemption_activity_log_df, redemption_activity_log_df.log_id == redemption_tid_log_df.rlog_id, how='inner')\
+                                                                 .join(dw_redemption_df, redemption_tid_log_df.t_id == dw_redemption_df.transaction_id, how='inner')\
+                                                                 .filter("member_id != ''")
+
+identify_by_Inapp_Free_Parking_Redemption = identify_by_Inapp_Free_Parking_Redemption.select(
+                                    lit('identify by Inapp Free Parking Redemption').alias('identify_type'),
+                                    'member_id',
+                                    'card_num',
+                                    upper(trim(col('car_plate'))).alias('car_plate'),
+                                    lit(None).alias('property_id'),
+                                    lit(None).alias('receipt_id'),
+                                    lit(None).alias('receipt_transaction_date'),
+                                    lit(None).alias('invoice_no'),
+                                    lit(None).alias('shop_id'),
+                                    lit(None).alias('shop_name'),
+                                    lit(None).alias('receipt_amount'),
+                                    lit(None).alias('property_id_parking'),
+                                    lit(None).alias('card_no_parking'),
+                                    lit(None).alias('car_plate_parking'),
+                                    col('r_time').alias('freeparking_redemption_date_parking'),
+                                    lit(None).alias('invoice_no_parking'),
+                                    lit(None).alias('shop_name_parking'),
+                                    lit(None).alias('receipt_amount_parking'),
+                                    col('t_id').alias('redemption_transaction_id'),
+                                    lit(None).alias('ev_charging_date'))\
+
+
+dw_parker_identify_history_raw = identify_by_Invoice_df.union(vehicles_df)\
+                                                   .union(identify_by_Inapp_Free_Parking_Redemption)\
+                                                   .union(identify_by_member_parking_df)\
+                                                   .union(identify_by_ev_charging_df)\
+                                                   .distinct()\
+                                                   .drop(col('card_no'))\
+                                                   .withColumn('card_no_parking', lit(''))
+
+dw_parker_identify_history_raw.createOrReplaceTempView("dm_parker_identify_history_raw")
+
+
+dw_parker_identify_history = dw_parker_identify_history_raw.join(member_df, upper(dw_parker_identify_history_raw.member_id) == upper(member_df.memberId), how='inner') \
+    .withColumn('car_plate_final', when(col('memberId').isNotNull() & col('car_plate').isNotNull() & (col('member_status') == 'V'), sha2(upper(col('car_plate')), 256)).otherwise(col('car_plate'))) \
+    .select('identify_type',
+            'member_id',
+            col('car_plate_final').alias('car_plate'),
+            'property_id',
+            'receipt_id',
+            'receipt_transaction_date',
+            'invoice_no',
+            'shop_id',
+            'shop_name',
+            'receipt_amount',
+            'property_id_parking',
+            'card_no_parking',
+            'car_plate_parking',
+            'freeparking_redemption_date_parking',
+            'invoice_no_parking',
+            'shop_name_parking',
+            'receipt_amount_parking',
+            'redemption_transaction_id',
+            'ev_charging_date')
+dw_parker_identify_history.createOrReplaceTempView("dm_parker_identify_history")
+
+
+dw_parker_identity = spark.sql("""
+    Select member_id,
+    car_plate,
+    max(case when identify_type in ('identify by Contactless Parking') then 1 else 0 end) as is_contactless_carplate,
+    max(case when identify_type in ('identify by Invoice', 'identify by Inapp Free Parking Redemption', 'identify by member parking') then 1 else 0 end) as is_member_parking_carplate,
+    max(case when identify_type in ('identify by EV Charging') then 1 else 0 end) as is_ev_charging_carplate
+    From dm_parker_identify_history
+    Group by member_id, car_plate
+""")
+
+## Data Transformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+history_output_path = output_path+'tpdt_dw_parker_identify_history/'
+dw_parker_identify_history.write.format('parquet').mode('overwrite').option("header",True).save(history_output_path)
+print(f"Result Saved in {history_output_path}...")
+
+identity_output_path = output_path+'tpdt_dw_parker_identity/'
+dw_parker_identity.write.format('parquet').mode('overwrite').option("header",True).save(identity_output_path)
+print(f"Result Saved in {identity_output_path}...")
+job.commit()
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------

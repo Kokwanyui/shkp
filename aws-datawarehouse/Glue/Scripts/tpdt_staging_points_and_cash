@@ -1,0 +1,192 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime, date, time, timezone,timedelta 
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import json
+import time
+import datetime
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'env'])
+##Initialization
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+spark.conf.set("spark.sql.session.timeZone", "GMT+8") 
+
+##Input and Output Config
+env = args['env']
+table_name = args['JOB_NAME']
+if env == 'prod':
+    db01="tpdt_01replica"
+    db03="tpdt_03dw"
+    db02="tpdt_02replica"
+    output_path="s3://tpdt-dw/"+table_name+"/"
+    staging_path="s3://tpdt-staging/"
+    dimension_path="s3://tpdt-dimension/"
+else:
+    db01="tpdt_01replica_"+env
+    db03="tpdt_03dw_"+env
+    output_path="s3://tpdt-dw-"+env+"/"+table_name+"/"
+    staging_path="s3://tpdt-staging-"+env+"/"
+    dimension_path="s3://tpdt-dimension-"+env+"/"
+
+
+prefix="shkpmalls_vip_"
+
+
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+##source table : brand
+t_brand = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'brand', transformation_ctx = "brand")
+brand_df = t_brand.toDF()\
+                  .select('brand_id','status',col('name_lang1').alias('brand_name'),'brand_category_id','shop_id_list')\
+                   .toPandas()
+
+
+##source table : brand_category
+t_brand_category  = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'brand_category', transformation_ctx = "brand_category")
+brand_category_df = t_brand.toDF()\
+                           .select('brand_category_id',col('name_lang1').alias('category_name'))\
+                           .toPandas()
+
+##source table : Coupon
+t_coupon  = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'coupon', transformation_ctx = "coupon")
+coupon_df = t_coupon.toDF()\
+                    .select('coupon_id', 'redeem_bonus_points_with_cash', 'reward_brand_id')\
+                    .filter("redeem_bonus_points_with_cash is not null")\
+                    .toPandas()
+
+##source table : Gift
+t_gift  = glueContext.create_dynamic_frame.from_catalog(database = db01, table_name = prefix+'gift', transformation_ctx = "gift")
+gift_df = t_gift.toDF()\
+                .select('gift_id', 'redeem_bonus_points_with_cash', 'reward_brand_id')\
+                .filter("redeem_bonus_points_with_cash is not null")\
+                .toPandas()
+## Source Extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Data Tranformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+list_clean = []
+for index, row in brand_df.iterrows():
+    df_interim = pd.DataFrame.from_records(json.loads(row['shop_id_list']))
+    for index, sub_row in df_interim.iterrows():
+        for sub_item in sub_row['shop_id']:
+            row_clean = []
+            row_clean.append(row['brand_id'])
+            row_clean.append(sub_row['mall_id'])
+            row_clean.append(sub_item)
+            list_clean.append(row_clean)
+
+shop_fin_list = ['brand_id', 'mall_id', 'shop_id']
+df_shop_detail = pd.DataFrame(np.array(list_clean), columns=shop_fin_list)
+brand_df['brand_id'] = brand_df['brand_id'].astype('str')
+df_brand_cleaned = pd.merge(brand_df, df_shop_detail, on=['brand_id', 'brand_id'], how='left')
+
+# Transformation 2: Category Part
+df_concat = pd.merge(df_brand_cleaned, brand_category_df, on=['brand_category_id', 'brand_category_id'], how='left')
+df_concat = df_concat.drop(columns=['shop_id_list'])
+df_concat['mall_id'] = df_concat['mall_id'].fillna(9999999).astype('int')
+df_concat['shop_id'] = df_concat['shop_id'].fillna(9999999).astype('int')
+
+
+# Transformation 3: Coupon Part
+list_clean=[]
+for index , row in coupon_df.iterrows():
+    df_interim = pd.DataFrame.from_records( json.loads(row['redeem_bonus_points_with_cash']))
+    df_interim['coupon_id']=row['coupon_id']
+    df_interim['reward_brand_id']=row['reward_brand_id']
+    list_clean.append(df_interim)
+
+df_fin_cleaned = pd.concat(list_clean)[['coupon_id' ,'tier','amount','bonus_point','reward_brand_id']]
+df_fin_cleaned = df_fin_cleaned.astype({'amount': 'float','bonus_point':'int32'})
+df_updated = df_fin_cleaned.groupby('coupon_id').agg({'amount':['sum','min'] , 'bonus_point':['sum','min']}).reset_index()
+
+
+dummy_list=[]
+for index , row in df_updated.iterrows():
+    sub_dummy_list=[row['coupon_id'][0]]
+    if row['amount']['min']==0 and row['bonus_point']['min']==0 :
+        sub_dummy_list.append('Points + Cash Only')
+    elif row['amount']['sum']>0 and row['bonus_point']['sum']>0:
+        sub_dummy_list.append('Hybrid')
+    elif row['amount']['sum']==0 :
+        sub_dummy_list.append('Points Only')
+    elif row['bonus_point']['sum']==0 :
+        sub_dummy_list.append('Cash Only')
+    dummy_list.append(sub_dummy_list)
+
+df_updated_again = pd.DataFrame(dummy_list, columns=['coupon_id','redeem_method_combination'])
+df_updated_coupon=pd.merge(df_fin_cleaned,df_updated_again, on=['coupon_id'], how='left')
+
+df_updated_coupon.rename(columns={'coupon_id':'gift_id'},inplace=True)
+
+# Transformation 4: Gift Part
+list_clean=[]
+for index , row in gift_df.iterrows():
+    df_interim = pd.DataFrame.from_records( json.loads(row['redeem_bonus_points_with_cash']))
+    df_interim['gift_id']=row['gift_id']
+    df_interim['reward_brand_id']=row['reward_brand_id']
+    list_clean.append(df_interim)
+
+df_fin_cleaned = pd.concat(list_clean)[['gift_id' ,'tier','amount','bonus_point','reward_brand_id']]
+df_fin_cleaned = df_fin_cleaned.astype({'amount': 'float','bonus_point':'int32'})
+df_updated = df_fin_cleaned.groupby('gift_id').agg({'amount':['sum','min'] , 'bonus_point':['sum','min']}).reset_index()
+
+
+dummy_list=[]
+for index , row in df_updated.iterrows():
+    sub_dummy_list=[row['gift_id'][0]]
+    if row['amount']['min']==0 and row['bonus_point']['min']==0 :
+        sub_dummy_list.append('Points + Cash Only')
+    elif row['amount']['sum']>0 and row['bonus_point']['sum']>0:
+        sub_dummy_list.append('Hybrid')
+    elif row['amount']['sum']==0 :
+        sub_dummy_list.append('Points Only')
+    elif row['bonus_point']['sum']==0 :
+        sub_dummy_list.append('Cash Only')
+    dummy_list.append(sub_dummy_list)
+
+df_updated_again = pd.DataFrame(dummy_list, columns=['gift_id','redeem_method_combination'])
+df_updated_gift=pd.merge(df_fin_cleaned,df_updated_again, on=['gift_id'], how='left')
+df_updated_final = pd.concat([df_updated_coupon , df_updated_gift ] )
+
+df_updated_final['redeem_method'] = ''
+n = 0
+for index, row in df_updated_final.iterrows():
+    if int(row['amount']) == 0 and int(row['bonus_point']) != 0:
+        df_updated_final.iloc[n, -1] = 'full point'
+    elif int(row['amount']) != 0 and int(row['bonus_point']) == 0:
+        df_updated_final.iloc[n, -1] = 'full cash'
+    elif int(row['amount']) != 0 and int(row['bonus_point']) != 0:
+        df_updated_final.iloc[n, -1] = 'point + cash'
+    n = n + 1
+    
+df_updated_final['reward_brand_id'] = df_updated_final['reward_brand_id'].fillna(9999999).astype('int')
+
+new_id_udf = udf(lambda id: None if id == 9999999 else id, IntegerType())
+df_concat = spark.createDataFrame(df_concat)\
+                 .withColumn("mall_id", new_id_udf('mall_id'))\
+                 .withColumn("shop_id", new_id_udf('shop_id'))
+df_updated_final = spark.createDataFrame(df_updated_final).withColumn("reward_brand_id", new_id_udf('reward_brand_id'))
+## Data Tranformation -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
+print("Saving Result into target destination...")
+df_concat_output_path = staging_path + 'tpdt_staging_point_or_cash_brand_list/'
+df_concat.write.format('parquet').mode('overwrite').option("header",True).save(df_concat_output_path)
+
+df_updated_final_output_path = staging_path + 'tpdt_staging_point_or_cash_tiers/'
+df_updated_final.write.format('parquet').mode('overwrite').option("header",True).save(df_updated_final_output_path)
+print("Result Saved in output_paths...")
+job.commit()
+## Loading Result to S3 -----------------------------------------------------------------------------------------------------------------------------------------------------------
